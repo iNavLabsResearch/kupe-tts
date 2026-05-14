@@ -280,6 +280,71 @@
     font-size: 11.5px;
   }
 
+  .tab-bar {
+    display: flex;
+    gap: 6px;
+    margin: 18px 0 0;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .tab-btn {
+    cursor: pointer;
+    font: inherit;
+    font-size: 13px;
+    padding: 10px 18px;
+    margin-bottom: -1px;
+    border: 1px solid transparent;
+    border-radius: 8px 8px 0 0;
+    background: transparent;
+    color: var(--muted);
+  }
+  .tab-btn:hover {
+    color: var(--text);
+    background: rgba(139, 146, 160, 0.08);
+  }
+  .tab-btn.active {
+    color: var(--text);
+    font-weight: 600;
+    background: var(--panel);
+    border-color: var(--border);
+    border-bottom-color: var(--panel);
+  }
+  .tab-panel {
+    display: none;
+    padding-top: 4px;
+  }
+  .tab-panel.active {
+    display: block;
+  }
+  table.voice-mgmt {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12.5px;
+    margin-top: 10px;
+  }
+  table.voice-mgmt th,
+  table.voice-mgmt td {
+    border: 1px solid var(--border);
+    padding: 8px 10px;
+    text-align: left;
+  }
+  table.voice-mgmt th {
+    background: var(--panel-2);
+    color: var(--muted);
+    font-weight: 600;
+  }
+  table.voice-mgmt td.actions {
+    white-space: nowrap;
+  }
+  table.voice-mgmt td.actions button {
+    margin-right: 6px;
+  }
+  .voice-mgmt-wrap {
+    max-height: 280px;
+    overflow: auto;
+    margin-top: 8px;
+  }
+
   /* small-screen polish */
   @media (max-width: 640px) {
     .container { padding: 14px; }
@@ -300,6 +365,13 @@
     later chunks generate in the background while the client plays the
     earlier ones — no "wait for previous chunk to finish" gaps.
   </p>
+
+  <div class="tab-bar" role="tablist">
+    <button type="button" class="tab-btn active" id="tabBtnStreams" role="tab" aria-selected="true">Stream tester</button>
+    <button type="button" class="tab-btn" id="tabBtnVoices" role="tab" aria-selected="false">Voice references</button>
+  </div>
+
+  <div id="tabStreams" class="tab-panel active">
 
   <!-- ============================================================== -->
   <!-- CONFIGURATION                                                  -->
@@ -404,35 +476,6 @@
   </div>
 
   <!-- ============================================================== -->
-  <!-- NEW PERSONA (hot-load, no server restart)                     -->
-  <!-- ============================================================== -->
-  <div class="panel">
-    <h2>New persona — upload reference clip</h2>
-    <p class="subtitle" style="margin-top:-6px;">
-      POSTs to <code style="font-size:12px;">/api/voices</code> on your API base. Saves <code>&lt;name&gt;_ref.json</code> + audio under
-      <code>voice_reference/</code> and hot-loads embeddings into every GPU worker.
-    </p>
-    <div class="form-grid">
-      <label>Persona id (letters, digits, underscore)
-        <input id="newVoiceName" placeholder="e.g. ravi" autocomplete="off" />
-      </label>
-      <label>Reference transcript (aligned with the clip)
-        <input id="newVoiceRefText" placeholder="What the speaker says in the reference audio…" />
-      </label>
-      <label>Default language (optional, ISO or empty)
-        <input id="newVoiceLang" placeholder="auto / en / hi …" />
-      </label>
-      <label>Reference audio file
-        <input id="newVoiceFile" type="file" accept=".wav,.mp3,.flac,.ogg,.webm,.m4a,audio/*" />
-      </label>
-    </div>
-    <div class="button-row">
-      <button id="createVoice" type="button">Create persona &amp; hot-load</button>
-      <span id="createVoiceStatus" class="hint"></span>
-    </div>
-  </div>
-
-  <!-- ============================================================== -->
   <!-- LIVE METRICS TABLE                                             -->
   <!-- ============================================================== -->
   <div class="panel">
@@ -496,6 +539,23 @@
         will be queued and played continuously.
       </div>
     </div>
+    <p class="hint" style="margin-top:12px;">
+      Every stream’s WAV chunks are kept <strong>in memory</strong> in this tab so you can export after the run
+      (starting a new run clears them — download first). Nothing is written to disk until you click download.
+    </p>
+    <div class="form-grid" style="margin-top:10px;">
+      <label>Download merged audio for stream
+        <select id="downloadStreamSelect"></select>
+      </label>
+      <label class="text-row">Cache status
+        <span id="audioCacheStatus" class="hint" style="display:block;margin-top:4px;">No chunks cached yet.</span>
+      </label>
+    </div>
+    <div class="button-row" style="margin-top:8px;">
+      <button type="button" id="btnDownloadStreamWav">Download selected WAV</button>
+      <button type="button" id="btnDownloadAllWavs" class="secondary">Download all streams (WAV)</button>
+      <button type="button" id="btnClearAudioCache" class="secondary">Clear audio cache</button>
+    </div>
   </div>
 
   <!-- ============================================================== -->
@@ -510,6 +570,90 @@
     </div>
   </div>
 
+  </div><!-- tabStreams -->
+
+  <div id="tabVoices" class="tab-panel">
+    <p class="subtitle" style="margin-top:8px;">
+      Uses the <strong>API base URL</strong> from the Stream tester tab. List, edit, rename, replace audio, or delete profiles
+      (files under <code>voice_reference/</code>). The server refuses to delete the last remaining profile.
+    </p>
+
+    <div class="panel">
+      <h2>Profiles on server</h2>
+      <div class="button-row" style="margin-top:8px;">
+        <button id="refreshVoiceMgmt" type="button" class="secondary">Refresh list</button>
+        <span id="voiceMgmtStatus" class="hint"></span>
+      </div>
+      <div class="voice-mgmt-wrap">
+        <table class="voice-mgmt">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Language</th>
+              <th>Cached</th>
+              <th>Default</th>
+              <th class="actions">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="voiceMgmtBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Edit profile</h2>
+      <p class="subtitle" style="margin-top:-6px;">
+        <code>GET /api/voices/{name}</code> loads fields; <code>PUT</code> saves (optional <code>new_name</code> renames files on disk).
+        Leave audio empty to keep the current file unless you change the transcript (cache may be cleared server-side).
+      </p>
+      <input type="hidden" id="editVoiceOriginal" value="" />
+      <div class="form-grid">
+        <label>Persona id (rename updates <code>&lt;name&gt;_ref.json</code> and audio filename)
+          <input id="editVoiceNewName" placeholder="Load a profile first…" autocomplete="off" />
+        </label>
+        <label>Reference transcript
+          <textarea id="editVoiceRefText" rows="3" spellcheck="false" placeholder="Transcript aligned with reference audio…"></textarea>
+        </label>
+        <label>Profile language (ISO code or empty)
+          <input id="editVoiceLang" placeholder="en / hi / …" autocomplete="off" />
+        </label>
+        <label>Replace reference audio (optional)
+          <input id="editVoiceFile" type="file" accept=".wav,.mp3,.flac,.ogg,.webm,.m4a,audio/*" />
+        </label>
+      </div>
+      <div class="button-row">
+        <button id="saveVoiceEdit" type="button">Save changes</button>
+        <button id="clearVoiceEdit" type="button" class="secondary">Clear form</button>
+        <span id="editVoiceStatus" class="hint"></span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>New persona — upload reference clip</h2>
+      <p class="subtitle" style="margin-top:-6px;">
+        POSTs to <code style="font-size:12px;">/api/voices</code>. Saves <code>&lt;name&gt;_ref.json</code> + audio and hot-loads workers.
+      </p>
+      <div class="form-grid">
+        <label>Persona id (letters, digits, underscore)
+          <input id="newVoiceName" placeholder="e.g. ravi" autocomplete="off" />
+        </label>
+        <label>Reference transcript (aligned with the clip)
+          <input id="newVoiceRefText" placeholder="What the speaker says in the reference audio…" />
+        </label>
+        <label>Default language (optional, ISO or empty)
+          <input id="newVoiceLang" placeholder="auto / en / hi …" />
+        </label>
+        <label>Reference audio file
+          <input id="newVoiceFile" type="file" accept=".wav,.mp3,.flac,.ogg,.webm,.m4a,audio/*" />
+        </label>
+      </div>
+      <div class="button-row">
+        <button id="createVoice" type="button">Create persona &amp; hot-load</button>
+        <span id="createVoiceStatus" class="hint"></span>
+      </div>
+    </div>
+  </div><!-- tabVoices -->
+
 </div>
 
 <script>
@@ -518,15 +662,11 @@
  * used when fetch('./sample_text.txt') fails (e.g. file:// origin).
  * ==================================================================== */
 const SAMPLE_TEXT = [
-  "ਕ੍ਰਿਸ਼ੀ ਪੰਜਾਬ ਦੀ ਆਤਮਾ ਹੈ। ਜਦੋਂ ਪਹਿਲਾ ਮੀਂਹ ਪੈਂਦਾ ਹੈ, ਤਾਂ ਧਰਤੀ ਆਪਣੀ ਤਰਸ ਬੁਝਾ ਕੇ ਹਰੀ-ਭਰੀ ਹੋ ਜਾਂਦੀ ਹੈ ਅਤੇ ਹਵਾ ਵਿੱਚ ਮਿੱਟੀ ਦੀ ਮਿੱਠੀ ਖੁਸ਼ਬੂ ਫੈਲ ਜਾਂਦੀ ਹੈ। ਕਿਸਾਨ ਕਪਾਹ, ਮੂੰਗਫਲੀ, ਗੰਧਮ, ਬਾਜਰਾ ਅਤੇ ਜਵਾਰ ਵਰਗੀਆਂ ਕਈ ਫਸਲਾਂ ਉਗਾਉਂਦੇ ਹਨ। ਹਰ ਇਕ ਫਸਲ ਪਿੱਛੇ ਸਾਲਾਂ ਦੀ ਮਿਹਨਤ, ਗਹਿਰੀ ਅਾਸਥਾ ਅਤੇ ਪਰਿਵਾਰ ਦਾ ਮਿਲ ਜੁਲ ਕੇ ਕੀਤਾ ਸੰਗਠਿਤ ਪੈਣਪ ਕਰ ਸਕਦਾ ਹੈ। ਜਦੋਂ ਫਸਲ ਲਣ ਲਈ ਤਿਆਰ ਹੁੰਦੀ ਹੈ, ਤਾਂ ਸਭ ਤੋਂ ਪਹਿਲਾਂ ਉਹ ਮੰਦਰ ਵਿੱਚ ਭੇਟ ਕੀਤੀ ਜਾਂਦੀ ਹੈ ਅਤੇ ਫਿਰ ਹੀ ਅਨਾਜ ਘਰ ਦੀ ਤਿਜ਼ੌਰੀ ਵਿੱਚ ਰੱਖਿਆ ਜਾਂਦਾ ਹੈ।",
-
-  "नमस्ते friends! पेश है प्राकृतिक मिठास का राजा — सीताफल, એટલે કે delicious Custard Apple! इसकी creamy texture, शानदार aroma और naturally sweet taste हर bite को खास बना देती है. જ્યારે તમે એકવાર સીતાફળનો સ્વાદ માણશો, ત્યારે તેની મીઠાશ તમને વારંવાર યાદ આવશે. Vitamins, fiber और natural energy से भरपूर सीताफल सिर्फ एक fruit नहीं, बल्कि पूरे family के लिए healthy lifestyle choice है. Kids हो, adults हो या elders — सबको इसका soft pulp और refreshing taste बहुत पसंद आता है. आज की busy life में हर कोई चाहता है कुछ tasty भी हो और healthy भी, और सीताफल दोनों का perfect combination है. यह energy boost करने में मदद करता है, digestion को support करता है और naturally fresh feeling देता है. ગુજરાતના તાજા ખેતરોમાંથી સીધું તમારા ઘર સુધી પહોંચતું આ fruit purity અને quality નો સાચો અનુભવ કરાવે છે. अगर आप ऐसा fruit ढूंढ रहे हैं जो premium, nutritious और authentic natural taste से भरपूर हो, तो सीताफल आपके लिए best choice है. Milkshakes, ice creams, desserts या smoothies — हर चीज़ में इसका flavor extra special बना देता है. તો હવે રાહ શા માટે? ઘરે લાવો કુદરતની મીઠાશ, માણો રાજાશાહી સ્વાદવાળું સીતાફળ અને દરેક bite સાથે health, happiness અને amazing taste નો આનંદ લો!",
-
-  "गुजरात के त्यौहार यहाँ के सामूहिक जीवन का हृदय हैं। नवरात्रि के नौ दिनों तक पूरा राज्य गरबा और डांडिया की ताल पर झूमता रहता है। युवक और युवतियाँ रंग-बिरंगे परिधान पहनकर माता की आरती में शामिल होते हैं, और रात भर ढोल-नगाड़ों की गूंज के साथ भक्ति और उल्लास का संगम महसूस होता है। उत्तरायण के दिन आकाश रंगीन पतंगों से भर जाता है, और बच्चों की 'काट्यो छे' की पुकार हर घर में गूंजती है। दिवाली पर हर घर के आँगन में रंगोली बनती है, और छोटे-छोटे दीयों की माला से गलियाँ चमक उठती हैं।",
-
-  "ગુજરાતી ભોજન પણ આપણા ગૌરવનો અતૂટ હિસ્સો છે. ઢોકળાં, ખાંડવી, થેપલાં, ફાફડા, જલેબી અને ઊંધિયું જેવી વાનગીઓ માત્ર સ્વાદની નહીં, પણ આત્મીયતાની નિશાની છે. ઘરમાં મહેમાન આવે ત્યારે પ્રથમ પાણી, પછી ગોળ-ઘી અને છેવટે ગરમ ચા આપવી — એ આપણી પરંપરા છે. કોઈ પણ વ્યક્તિ ભૂખ્યો આપણા ઘરેથી પાછો ન જાય, એ સંકલ્પ ગુજરાતી પરિવારોના હૃદયમાં વસ્યો છે. દરેક રાંધણ પાછળ માતાનો પ્રેમ, દાદીના આશીર્વાદ અને પેઢીઓની યાદો સમાયેલી છે. એટલે જ આપણા રસોડામાંથી નીકળતી સુગંધ માત્ર ભૂખ નહીં, પણ આત્માની તૃપ્તિ આપે છે.",
-
-  "গ্রামজীবনের প্রধান আকর্ষণ এখানকার সরলতা এবং নিষ্কপট স্নেহ। সন্ধ্যেবেলায় বয়োজ্যেষ্ঠেরা বারান্দায় বসে শিশুদের রামায়ণ, মহাভারত এবং নরসিংহ মেহেতার ভক্তিগাথা শোনান। মায়েরা চুলায় গরম রুটি, সবজি ও খিচুড়ি তৈরি করেন, আর ঘরের পরিবেশ ঘি ও মশলার সুবাসে ভরে ওঠে। গ্রামের স্কুলে শিক্ষকরা শুধু পুস্তকজ্ঞানই নয়, বরং সংস্কার, অহিংসা ও সত্যের গুরুত্বও শিখিয়ে দেন। প্রতিটি পাঠের সাথে গান্ধীজি ও সর্দার প্যাটেলের আদর্শ শিশুদের মনে গভীরে গেঁথে যায়।"
+  "The temperature was -3.5 degrees and visibility was 0 km.",
+  "Pai is approximately 3.14159.",
+  "There are 1000000 bytes in a megabyte.",
+  "यहाँ एक हिंदी वाक्य है: मेरे पास 2 किताबें और 5.85 पेन हैं।",
+  "મારી પાસે 3 પુસ્તકો અને 10 પેન છે."
 ].join("\n\n");
 
 /* ====================================================================
@@ -559,6 +699,9 @@ let runStartedAt   = 0;
 let wallTimer      = null;
 let chunkRows      = [];   // per-chunk timeline records
 let chunkFilterId  = 0;    // 0 = all streams
+
+/** { [streamId: number]: ArrayBuffer[] } — full WAV file bytes per chunk, receive order */
+let streamAudioChunks = {};
 
 /* ====================================================================
  * DOM helpers
@@ -651,30 +794,36 @@ function mergeVoiceNamesFromPayload(j) {
   return [...set].sort((a, b) => a.localeCompare(b));
 }
 
-async function refreshVoiceList() {
+/** Shared GET /api/voices for dropdown + voice management table. */
+async function fetchVoicesJson() {
   const base = apiBaseTrim();
+  const url = base + '/api/voices';
+  const r = await fetch(url, {
+    cache: 'no-store',
+    headers: tunnelBrowserFetchHeaders(),
+  });
+  const ct = (r.headers.get('content-type') || '').toLowerCase();
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`HTTP ${r.status}: ${t.slice(0, 180).replace(/\s+/g, ' ')}`);
+  }
+  if (!ct.includes('application/json')) {
+    const t = await r.text();
+    throw new Error(
+      `Expected JSON from /api/voices, got ${ct || 'unknown'} ` +
+      `(tunnel HTML? try ngrok header). Body: ${t.slice(0, 120).replace(/\s+/g, ' ')}…`
+    );
+  }
+  const j = await r.json();
+  return { base, url, j };
+}
+
+async function refreshVoiceList() {
   const hint = $('hintLine');
   const sel = $('voiceSelect');
   const prev = sel.value;
   try {
-    const url = base + '/api/voices';
-    const r = await fetch(url, {
-      cache: 'no-store',
-      headers: tunnelBrowserFetchHeaders(),
-    });
-    const ct = (r.headers.get('content-type') || '').toLowerCase();
-    if (!r.ok) {
-      const t = await r.text();
-      throw new Error(`HTTP ${r.status}: ${t.slice(0, 180).replace(/\s+/g, ' ')}`);
-    }
-    if (!ct.includes('application/json')) {
-      const t = await r.text();
-      throw new Error(
-        `Expected JSON from /api/voices, got ${ct || 'unknown'} ` +
-        `(tunnel HTML? try ngrok header). Body: ${t.slice(0, 120).replace(/\s+/g, ' ')}…`
-      );
-    }
-    const j = await r.json();
+    const { url, j } = await fetchVoicesJson();
     const names = mergeVoiceNamesFromPayload(j);
     sel.innerHTML = '';
     if (!names.length) {
@@ -703,6 +852,195 @@ async function refreshVoiceList() {
     o.textContent = 'shanti (fetch failed — see hint line)';
     sel.appendChild(o);
   }
+}
+
+async function refreshVoiceManagementTable() {
+  const st = $('voiceMgmtStatus');
+  const tbody = $('voiceMgmtBody');
+  if (!st || !tbody) return;
+  st.textContent = 'Loading…';
+  tbody.innerHTML = '';
+  try {
+    const { j } = await fetchVoicesJson();
+    const profiles = Array.isArray(j.profiles) ? j.profiles : [];
+    const def = j.default_voice || '';
+    for (const p of profiles) {
+      const tr = document.createElement('tr');
+      if (p.error) {
+        tr.innerHTML =
+          `<td colspan="5" style="color:var(--error);">${escapeHtml(p.name)} — ${escapeHtml(p.error)}</td>`;
+        tbody.appendChild(tr);
+        continue;
+      }
+      const name = String(p.name || '').trim();
+      if (!name) continue;
+      const safe = escapeHtml(name);
+      tr.innerHTML =
+        `<td><code>${safe}</code></td>` +
+        `<td>${escapeHtml(p.language || '—')}</td>` +
+        `<td>${p.cached ? 'yes' : 'no'}</td>` +
+        `<td>${name === def ? 'yes' : ''}</td>` +
+        `<td class="actions">` +
+        `<button type="button" class="secondary" data-action="load" data-name="${safe}">Load</button>` +
+        `<button type="button" class="secondary" data-action="delete" data-name="${safe}">Delete</button>` +
+        `</td>`;
+      tbody.appendChild(tr);
+    }
+    st.textContent = `${profiles.length} profile(s)`;
+  } catch (e) {
+    st.textContent = e.message || String(e);
+  }
+}
+
+async function loadVoiceForEdit(name) {
+  const st = $('editVoiceStatus');
+  st.textContent = 'Loading…';
+  try {
+    const base = apiBaseTrim();
+    const r = await fetch(base + '/api/voices/' + encodeURIComponent(name), {
+      cache: 'no-store',
+      headers: tunnelBrowserFetchHeaders(),
+    });
+    const ct = (r.headers.get('content-type') || '').toLowerCase();
+    const txt = await r.text();
+    let j = null;
+    try { j = JSON.parse(txt); } catch { /* */ }
+    if (!r.ok) {
+      const detail = j && (j.detail || j.message);
+      const msg = typeof detail === 'string' ? detail : (detail ? JSON.stringify(detail) : txt);
+      throw new Error(msg || `HTTP ${r.status}`);
+    }
+    if (!ct.includes('application/json')) {
+      throw new Error('Expected JSON from /api/voices/{name}');
+    }
+    const p = j;
+    $('editVoiceOriginal').value = p.name;
+    $('editVoiceNewName').value = p.name;
+    $('editVoiceRefText').value = p.ref_text || '';
+    $('editVoiceLang').value = p.language || '';
+    $('editVoiceFile').value = '';
+    st.textContent = `Loaded “${p.name}”. Path: ${p.ref_audio_file || '—'}`;
+  } catch (e) {
+    st.textContent = 'Error: ' + e.message;
+  }
+}
+
+function clearVoiceEditForm() {
+  $('editVoiceOriginal').value = '';
+  $('editVoiceNewName').value = '';
+  $('editVoiceRefText').value = '';
+  $('editVoiceLang').value = '';
+  $('editVoiceFile').value = '';
+  $('editVoiceStatus').textContent = '';
+}
+
+async function saveVoiceEdit() {
+  const st = $('editVoiceStatus');
+  st.textContent = '';
+  const orig = ($('editVoiceOriginal').value || '').trim();
+  if (!orig) {
+    alert('Load a profile with “Load” first.');
+    return;
+  }
+  const newName = ($('editVoiceNewName').value || '').trim();
+  const refText = ($('editVoiceRefText').value || '').trim();
+  const language = ($('editVoiceLang').value || '').trim();
+  const fileIn = $('editVoiceFile');
+  if (!refText) {
+    alert('Reference transcript cannot be empty.');
+    return;
+  }
+  if (!newName) {
+    alert('Persona id cannot be empty.');
+    return;
+  }
+  const fd = new FormData();
+  if (newName !== orig) fd.append('new_name', newName);
+  fd.append('ref_text', refText);
+  fd.append('language', language);
+  if (fileIn.files && fileIn.files[0]) {
+    fd.append('file', fileIn.files[0], fileIn.files[0].name);
+  }
+  st.textContent = 'Saving…';
+  try {
+    const base = apiBaseTrim();
+    const r = await fetch(base + '/api/voices/' + encodeURIComponent(orig), {
+      method: 'PUT',
+      headers: { 'ngrok-skip-browser-warning': 'true' },
+      body: fd,
+    });
+    const txt = await r.text();
+    let j = null;
+    try { j = JSON.parse(txt); } catch { /* */ }
+    if (!r.ok) {
+      const detail = j && (j.detail || j.message);
+      const msg = typeof detail === 'string' ? detail : (detail ? JSON.stringify(detail) : txt);
+      throw new Error(msg || `HTTP ${r.status}`);
+    }
+    if (j.metadata_only) {
+      st.textContent = `Updated language only (“${j.name}”).`;
+    } else {
+      const pids = (j.worker_pids || []).join(', ');
+      st.textContent = `Saved “${j.name}”. Workers: ${pids || '—'}.`;
+    }
+    const nextKey = j.name || newName;
+    $('editVoiceOriginal').value = nextKey;
+    $('editVoiceNewName').value = nextKey;
+    $('editVoiceFile').value = '';
+    await refreshVoiceList();
+    await refreshVoiceManagementTable();
+  } catch (e) {
+    st.textContent = 'Error: ' + e.message;
+  }
+}
+
+async function deleteVoiceProfile(name) {
+  if (!name) return;
+  if (!confirm(`Delete voice “${name}”?\n\nThis removes JSON, reference audio, and embedding cache from the server disk.`)) {
+    return;
+  }
+  const st = $('voiceMgmtStatus');
+  st.textContent = 'Deleting…';
+  try {
+    const base = apiBaseTrim();
+    const r = await fetch(base + '/api/voices/' + encodeURIComponent(name), {
+      method: 'DELETE',
+      headers: tunnelBrowserFetchHeaders(),
+    });
+    const txt = await r.text();
+    let j = null;
+    try { j = JSON.parse(txt); } catch { /* */ }
+    if (!r.ok) {
+      const detail = j && (j.detail || j.message);
+      const msg = typeof detail === 'string' ? detail : (detail ? JSON.stringify(detail) : txt);
+      throw new Error(msg || `HTTP ${r.status}`);
+    }
+    st.textContent = `Deleted “${j.deleted || name}”. Default: ${j.default_voice || '—'}`;
+    if (($('editVoiceOriginal').value || '').trim() === name) clearVoiceEditForm();
+    await refreshVoiceList();
+    await refreshVoiceManagementTable();
+  } catch (e) {
+    st.textContent = 'Error: ' + e.message;
+  }
+}
+
+const LS_MAIN_TAB = 'omnivoice_demo_main_tab';
+
+function setMainTab(which) {
+  const streams = $('tabStreams');
+  const voices = $('tabVoices');
+  const bS = $('tabBtnStreams');
+  const bV = $('tabBtnVoices');
+  const voiceActive = which === 'voices';
+  if (!streams || !voices || !bS || !bV) return;
+  streams.classList.toggle('active', !voiceActive);
+  voices.classList.toggle('active', voiceActive);
+  bS.classList.toggle('active', !voiceActive);
+  bV.classList.toggle('active', voiceActive);
+  bS.setAttribute('aria-selected', String(!voiceActive));
+  bV.setAttribute('aria-selected', String(voiceActive));
+  try { localStorage.setItem(LS_MAIN_TAB, which); } catch (_) {}
+  if (voiceActive) refreshVoiceManagementTable();
 }
 
 async function createPersona() {
@@ -744,6 +1082,7 @@ async function createPersona() {
     const pids = (j.worker_pids || []).join(', ');
     status.textContent = `Hot-loaded “${j.name}”. Workers touched: ${pids || '—'}`;
     await refreshVoiceList();
+    await refreshVoiceManagementTable();
     if (j.name) $('voiceSelect').value = j.name;
   } catch (e) {
     status.textContent = 'Error: ' + e.message;
@@ -791,6 +1130,223 @@ function buildTable(n) {
     }
     body.appendChild(tr);
   }
+  rebuildAudioDownloadSelect(n);
+}
+
+function rebuildAudioDownloadSelect(n) {
+  const sel = $('downloadStreamSelect');
+  if (!sel) return;
+  const prev = parseInt(sel.value, 10);
+  sel.innerHTML = '';
+  for (let i = 1; i <= n; i++) {
+    const o = document.createElement('option');
+    o.value = String(i);
+    o.textContent = `Stream ${i}`;
+    sel.appendChild(o);
+  }
+  const use = (Number.isFinite(prev) && prev >= 1 && prev <= n) ? prev : Math.min(n, Math.max(1, playStreamId));
+  sel.value = String(use);
+}
+
+function initStreamAudioChunksForRun(concurrent) {
+  streamAudioChunks = {};
+  for (let i = 1; i <= concurrent; i++) streamAudioChunks[i] = [];
+  refreshAudioCacheStatus();
+}
+
+function resizeStreamAudioChunksToN(n) {
+  const next = {};
+  for (let i = 1; i <= n; i++) {
+    next[i] = Array.isArray(streamAudioChunks[i]) ? streamAudioChunks[i] : [];
+  }
+  streamAudioChunks = next;
+  rebuildAudioDownloadSelect(n);
+  refreshAudioCacheStatus();
+}
+
+function wavBase64ToArrayBuffer(b64) {
+  const bin = atob(b64);
+  const buf = new ArrayBuffer(bin.length);
+  const u8 = new Uint8Array(buf);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return buf;
+}
+
+function wavParseChunks(u8) {
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  if (u8.length < 44) throw new Error('WAV too short');
+  const riff = String.fromCharCode(u8[0], u8[1], u8[2], u8[3]);
+  const wave = String.fromCharCode(u8[8], u8[9], u8[10], u8[11]);
+  if (riff !== 'RIFF' || wave !== 'WAVE') throw new Error('Not a WAV file');
+  let o = 12;
+  let pcmOffset = -1;
+  let pcmLength = 0;
+  let numChannels = 1;
+  let sampleRate = 24_000;
+  let bitsPerSample = 16;
+  while (o + 8 <= u8.length) {
+    const id = String.fromCharCode(u8[o], u8[o + 1], u8[o + 2], u8[o + 3]);
+    const sz = dv.getUint32(o + 4, true);
+    const start = o + 8;
+    const pad = sz % 2;
+    if (id === 'fmt ' && sz >= 16) {
+      numChannels = dv.getUint16(start + 2, true);
+      sampleRate = dv.getUint32(start + 4, true);
+      bitsPerSample = dv.getUint16(start + 14, true);
+    } else if (id === 'data') {
+      pcmOffset = start;
+      pcmLength = sz;
+    }
+    o = start + sz + pad;
+  }
+  if (pcmOffset < 0) throw new Error('WAV missing data chunk');
+  return { pcmOffset, pcmLength, numChannels, sampleRate, bitsPerSample };
+}
+
+function mergeWavChunkArrayBuffers(chunks) {
+  if (!chunks || !chunks.length) return null;
+  const first = new Uint8Array(chunks[0]);
+  const base = wavParseChunks(first);
+  if (base.bitsPerSample !== 16) {
+    throw new Error(`Merge supports 16-bit PCM only (got ${base.bitsPerSample}-bit).`);
+  }
+  const parts = [];
+  let total = 0;
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const u8 = new Uint8Array(chunks[ci]);
+    const inf = wavParseChunks(u8);
+    if (inf.sampleRate !== base.sampleRate || inf.numChannels !== base.numChannels
+        || inf.bitsPerSample !== 16) {
+      throw new Error('WAV format mismatch between chunks (sample rate / channels must match).');
+    }
+    const slice = u8.subarray(inf.pcmOffset, inf.pcmOffset + inf.pcmLength);
+    parts.push(slice);
+    total += slice.length;
+  }
+  const pcm = new Uint8Array(total);
+  let pos = 0;
+  for (const s of parts) {
+    pcm.set(s, pos);
+    pos += s.length;
+  }
+  return buildWavFromPcm16(pcm, base.sampleRate, base.numChannels);
+}
+
+function buildWavFromPcm16(pcmUint8, sampleRate, numChannels) {
+  const bitsPerSample = 16;
+  const bytesPerSample = bitsPerSample / 8;
+  const blockAlign = numChannels * bytesPerSample;
+  const byteRate = sampleRate * blockAlign;
+  const dataSize = pcmUint8.length;
+  const headerSize = 44;
+  const buffer = new ArrayBuffer(headerSize + dataSize);
+  const v = new DataView(buffer);
+  const w = new Uint8Array(buffer);
+  const wr = (off, s) => { for (let i = 0; i < s.length; i++) w[off + i] = s.charCodeAt(i); };
+  wr(0, 'RIFF');
+  v.setUint32(4, 36 + dataSize, true);
+  wr(8, 'WAVE');
+  wr(12, 'fmt ');
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true);
+  v.setUint16(22, numChannels, true);
+  v.setUint32(24, sampleRate, true);
+  v.setUint32(28, byteRate, true);
+  v.setUint16(32, blockAlign, true);
+  v.setUint16(34, bitsPerSample, true);
+  wr(36, 'data');
+  v.setUint32(40, dataSize, true);
+  w.set(pcmUint8, 44);
+  return buffer;
+}
+
+function triggerDownloadArrayBuffer(ab, filename) {
+  const blob = new Blob([ab], { type: 'audio/wav' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2500);
+}
+
+function refreshAudioCacheStatus() {
+  const el = $('audioCacheStatus');
+  if (!el) return;
+  const ids = Object.keys(streamAudioChunks).map((k) => parseInt(k, 10)).filter(Number.isFinite).sort((a, b) => a - b);
+  if (!ids.length) {
+    el.textContent = 'No chunks cached yet.';
+    return;
+  }
+  const parts = [];
+  let totalBytes = 0;
+  let anyChunks = false;
+  for (const id of ids) {
+    const arr = streamAudioChunks[id] || [];
+    if (arr.length) anyChunks = true;
+    let b = 0;
+    for (const ab of arr) b += ab.byteLength || 0;
+    totalBytes += b;
+    parts.push(`S${id}: ${arr.length} chunk(s)`);
+  }
+  if (!anyChunks) {
+    el.textContent = `Streams ${ids[0]}–${ids[ids.length - 1]} ready · no WAV data yet (press Start).`;
+    return;
+  }
+  const mb = (totalBytes / (1024 * 1024)).toFixed(2);
+  el.textContent = `${parts.join(' · ')} · ~${mb} MiB raw (in RAM)`;
+}
+
+function downloadMergedStreamWav(streamId) {
+  const chunks = streamAudioChunks[streamId];
+  if (!chunks || !chunks.length) {
+    alert(`No audio cached for stream ${streamId}. Run a job first (chunks appear as they arrive).`);
+    return;
+  }
+  try {
+    const merged = mergeWavChunkArrayBuffers(chunks);
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    triggerDownloadArrayBuffer(merged, `omnivoice_stream${streamId}_${ts}.wav`);
+  } catch (e) {
+    alert(`Could not build WAV: ${e.message}`);
+  }
+}
+
+function downloadAllStreamsWavs() {
+  const sel = $('downloadStreamSelect');
+  const n = sel ? parseInt(sel.options.length ? sel.options.length : '0', 10) : 0;
+  if (!n) {
+    alert('Set “Concurrent streams” first.');
+    return;
+  }
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  let scheduled = 0;
+  for (let i = 1; i <= n; i++) {
+    const chunks = streamAudioChunks[i];
+    if (!chunks || !chunks.length) continue;
+    const sid = i;
+    setTimeout(() => {
+      try {
+        const merged = mergeWavChunkArrayBuffers(streamAudioChunks[sid]);
+        triggerDownloadArrayBuffer(merged, `omnivoice_stream${sid}_${ts}.wav`);
+      } catch (e) {
+        log(0, 'err', `download stream ${sid}: ${e.message}`);
+      }
+    }, scheduled * 350);
+    scheduled++;
+  }
+  if (scheduled === 0) {
+    alert('No streams have cached chunks yet.');
+  }
+}
+
+function clearAudioDownloadCache() {
+  const n = Math.max(1, parseInt($('concurrent').value, 10) || 1);
+  streamAudioChunks = {};
+  for (let i = 1; i <= n; i++) streamAudioChunks[i] = [];
+  refreshAudioCacheStatus();
 }
 
 function setCell(streamId, metricId, value, asHtml = false) {
@@ -970,14 +1526,10 @@ function setAudioCard(playing, message) {
   if (message) $('audioLine').innerHTML = message;
 }
 
-async function playWavBase64(b64) {
+async function playWavArrayBuffer(wavAb) {
   if (!audioCtx) return;
   try {
-    const bin = atob(b64);
-    const buf = new ArrayBuffer(bin.length);
-    const u8  = new Uint8Array(buf);
-    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-    const audioBuf = await audioCtx.decodeAudioData(buf);
+    const audioBuf = await audioCtx.decodeAudioData(wavAb.slice(0));
     const src = audioCtx.createBufferSource();
     src.buffer = audioBuf;
     src.connect(audioCtx.destination);
@@ -1064,7 +1616,17 @@ function runStream(streamId, params, onComplete) {
         `chunk[${m.chunk_index}]  ${wallPart}${sincePart}${ep}  ` +
         `audio=${audSec}s  text="${preview}${(m.chunk_text||'').length > 50 ? '…' : ''}"`);
 
-      if (streamId === playStreamId) playWavBase64(m.delta);
+      let wavAb;
+      try {
+        wavAb = wavBase64ToArrayBuffer(m.delta);
+      } catch (e) {
+        log(streamId, 'err', `audio base64 decode failed: ${e.message}`);
+        return;
+      }
+      if (!streamAudioChunks[streamId]) streamAudioChunks[streamId] = [];
+      streamAudioChunks[streamId].push(wavAb);
+      refreshAudioCacheStatus();
+      if (streamId === playStreamId) playWavArrayBuffer(wavAb);
     }
     else if (m.type === 'response.audio.done') {
       const wall = performance.now() - state.tSend;
@@ -1193,6 +1755,7 @@ async function startRun() {
   buildTable(concurrent);
   rebuildChunkFilter(concurrent);
   clearChunkLog();
+  initStreamAudioChunksForRun(concurrent);
   $('streamsTotalCount').textContent = concurrent;
   $('streamsDoneCount').textContent  = '0';
   $('fclSummary').textContent        = '—';
@@ -1299,10 +1862,30 @@ window.addEventListener('DOMContentLoaded', () => {
     syncWsFromApiBase();
     saveApiPrefs();
     refreshVoiceList();
+    if ($('tabVoices') && $('tabVoices').classList.contains('active')) refreshVoiceManagementTable();
   });
   $('url').addEventListener('change', saveApiPrefs);
   $('refreshVoices').addEventListener('click', () => { saveApiPrefs(); refreshVoiceList(); });
   $('createVoice').addEventListener('click', createPersona);
+
+  $('tabBtnStreams').addEventListener('click', () => setMainTab('streams'));
+  $('tabBtnVoices').addEventListener('click', () => setMainTab('voices'));
+  $('refreshVoiceMgmt').addEventListener('click', () => { saveApiPrefs(); refreshVoiceManagementTable(); });
+  $('saveVoiceEdit').addEventListener('click', saveVoiceEdit);
+  $('clearVoiceEdit').addEventListener('click', clearVoiceEditForm);
+  $('voiceMgmtBody').addEventListener('click', (ev) => {
+    const b = ev.target.closest('button[data-action]');
+    if (!b || !b.dataset.name) return;
+    const raw = b.getAttribute('data-name');
+    if (!raw) return;
+    if (b.dataset.action === 'load') loadVoiceForEdit(raw);
+    else if (b.dataset.action === 'delete') deleteVoiceProfile(raw);
+  });
+
+  try {
+    const t = localStorage.getItem(LS_MAIN_TAB);
+    if (t === 'voices') setMainTab('voices');
+  } catch (_) {}
 
   loadSampleFile();   // overlay with the file content if reachable
   refreshVoiceList();
@@ -1313,18 +1896,34 @@ window.addEventListener('DOMContentLoaded', () => {
   $('loadFile').addEventListener('click', loadSampleFile);
   $('concurrent').addEventListener('change', () => {
     const n = Math.max(1, parseInt($('concurrent').value, 10) || 1);
-    if ($('start').disabled === false) buildTable(n);
+    if ($('start').disabled === false) {
+      buildTable(n);
+      rebuildChunkFilter(n);
+      resizeStreamAudioChunksToN(n);
+    }
   });
   $('playStream').addEventListener('change', () => {
     const n = parseInt($('concurrent').value, 10) || 1;
     playStreamId = Math.min(n, Math.max(1, parseInt($('playStream').value, 10) || 1));
     highlightPlayingHeader();
+    const ds = $('downloadStreamSelect');
+    if (ds && [...ds.options].some((o) => o.value === String(playStreamId))) {
+      ds.value = String(playStreamId);
+    }
   });
   $('chunkFilter').addEventListener('change', () => {
     chunkFilterId = parseInt($('chunkFilter').value, 10) || 0;
     rerenderChunkTable();
   });
   rebuildChunkFilter(parseInt($('concurrent').value, 10) || 3);
+  resizeStreamAudioChunksToN(parseInt($('concurrent').value, 10) || 3);
+
+  $('btnDownloadStreamWav').addEventListener('click', () => {
+    const sid = parseInt($('downloadStreamSelect').value, 10) || 1;
+    downloadMergedStreamWav(sid);
+  });
+  $('btnDownloadAllWavs').addEventListener('click', downloadAllStreamsWavs);
+  $('btnClearAudioCache').addEventListener('click', clearAudioDownloadCache);
 });
 </script>
 </body>

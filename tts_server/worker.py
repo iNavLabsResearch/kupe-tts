@@ -455,6 +455,41 @@ def worker_add_voice(name: str, spec: dict, model_id: str) -> int:
     return int(os.getpid())
 
 
+def worker_remove_voice(name: str) -> int:
+    """Remove a voice from this worker. Picks a new ``_default_voice`` if needed."""
+    import os
+
+    global _prompts, _default_voice
+
+    if _model is None:
+        raise RuntimeError("worker_remove_voice: model not initialised.")
+    name = str(name).strip()
+    if name not in _prompts:
+        raise KeyError(f"Voice '{name}' is not loaded in this worker.")
+    del _prompts[name]
+    if _default_voice == name and _prompts:
+        _default_voice = sorted(_prompts.keys())[0]
+        log.info("Default voice was %r; reassigned to %r in pid=%d", name, _default_voice, os.getpid())
+    log.info("[%s] Removed voice from worker pid=%d", name, os.getpid())
+    return int(os.getpid())
+
+
+def worker_set_default_voice(voice_name: str) -> int:
+    """Set the worker's fallback voice name (must exist in ``_prompts``)."""
+    import os
+
+    global _default_voice
+
+    if _model is None:
+        raise RuntimeError("worker_set_default_voice: model not initialised.")
+    voice_name = str(voice_name).strip()
+    if voice_name not in _prompts:
+        raise KeyError(f"Voice '{voice_name}' is not loaded in this worker.")
+    _default_voice = voice_name
+    log.info("Default voice set to %r (pid=%d)", voice_name, os.getpid())
+    return int(os.getpid())
+
+
 def worker_probe() -> dict:
     """No-op task used to force ``worker_init`` to complete during lifespan
     startup.  Submitting ``MAX_WORKERS`` of these in parallel guarantees every
