@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
+
+from .config import EPOCHS_MAX, EPOCHS_MIN
 
 
 class BatchTTSRequest(BaseModel):
@@ -40,6 +42,44 @@ class BatchTTSRequest(BaseModel):
         ),
     )
     use_high_quality: bool = False
+    epochs: Optional[int] = Field(
+        default=None,
+        ge=EPOCHS_MIN,
+        le=EPOCHS_MAX,
+        description=(
+            "Diffusion / iterative decoding steps (OmniVoice ``num_step``). "
+            "Higher values tend to improve quality at the cost of latency. "
+            "Omitted → server defaults (see ``first_chunk_steps`` / "
+            "``rest_chunk_steps`` on ``/health``).  JSON alias: "
+            "``inference_steps``."
+        ),
+        validation_alias=AliasChoices("epochs", "inference_steps"),
+    )
+    digit_words_lang: Optional[str] = Field(
+        default=None,
+        description=(
+            "Legacy alias for ``digit_pronunciation`` when value is one of the "
+            "cardinal locales ``en``/``hi``/``gu``/``kn`` or another recognised "
+            "code. Prefer ``digit_pronunciation`` for new clients."
+        ),
+    )
+    digit_words_hint: Optional[str] = Field(
+        default=None,
+        description=(
+            "When ``digit_pronunciation`` / ``digit_words_lang`` omitted, "
+            "``hinglish`` / ``en`` / ``english_digits`` uses **English** digit "
+            "words inside Indic / SEA scripts — typical modern Hinglish."
+        ),
+    )
+    digit_pronunciation: Optional[str] = Field(
+        default=None,
+        description=(
+            "How digits should be **spoken** (ISO code or alias), e.g. ``ta``, "
+            "``bn``, ``hi``, ``en``, ``ar``. Overrides script auto-detect. "
+            "See server ``digit_to_words.supported_digit_pronunciations()``."
+        ),
+        validation_alias=AliasChoices("digit_pronunciation", "digitPronunciation"),
+    )
 
 
 class BatchTTSItem(BaseModel):
@@ -57,3 +97,6 @@ class BatchTTSResponse(BaseModel):
     language:              str
     voice:                 str
     speed:                 Optional[float] = None
+    epochs:                int = Field(
+        description="``num_step`` applied to every item in this response.",
+    )

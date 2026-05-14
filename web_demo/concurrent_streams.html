@@ -340,6 +340,9 @@
       <label>Speed (0.25 – 3.0)
         <input id="speed" type="number" min="0.25" max="3" step="0.05" value="1.00" />
       </label>
+      <label title="Diffusion / decoding steps (OmniVoice num_step). Empty = server default (16 for first and rest chunks unless env overrides).">Epochs (diffusion steps)
+        <input id="epochs" type="number" min="1" max="128" step="1" placeholder="default" />
+      </label>
       <label>Concurrent streams
         <input id="concurrent" type="number" min="1" max="32" value="5" />
       </label>
@@ -356,10 +359,31 @@
         </select>
       </label>
       <label>&nbsp;</label>
+      <label>Digit pronunciation (how digits are spoken)
+        <input id="digitPronunciation" list="digitPronList" placeholder="empty = auto from script" autocomplete="off" />
+      </label>
+      <label>Digit hint
+        <select id="digitHint">
+          <option value="" selected>— none —</option>
+          <option value="hinglish">hinglish (English digits in Indic/SEA text)</option>
+        </select>
+      </label>
       <label class="text-row">Text (broadcast identically to every stream)
         <textarea id="text" spellcheck="false"></textarea>
       </label>
     </div>
+    <datalist id="digitPronList">
+      <option value="en"></option><option value="hi"></option><option value="gu"></option><option value="kn"></option>
+      <option value="bn"></option><option value="as"></option><option value="ta"></option><option value="te"></option>
+      <option value="ml"></option><option value="pa"></option><option value="or"></option><option value="ne"></option>
+      <option value="si"></option><option value="ur"></option><option value="ar"></option><option value="my"></option>
+      <option value="th"></option><option value="lo"></option><option value="km"></option>
+      <option value="es"></option><option value="fr"></option><option value="de"></option><option value="pt"></option>
+      <option value="it"></option><option value="nl"></option><option value="pl"></option><option value="ru"></option>
+      <option value="uk"></option><option value="tr"></option><option value="vi"></option><option value="zh"></option>
+      <option value="ja"></option><option value="ko"></option><option value="id"></option><option value="ms"></option>
+      <option value="tl"></option>
+    </datalist>
     <div class="button-row">
       <button id="start">▶  Start</button>
       <button id="stop" class="secondary" disabled>■  Stop</button>
@@ -767,11 +791,16 @@ function runStream(streamId, params, onComplete) {
     };
     if (params.language && params.language !== 'auto') msg.language = params.language;
     if (params.high_quality) msg.use_high_quality = true;
+    if (params.epochs != null) msg.epochs = params.epochs;
+    if (params.digitPronunciation) msg.digit_pronunciation = params.digitPronunciation;
+    if (params.digitHint) msg.digit_words_hint = params.digitHint;
     ws.send(JSON.stringify(msg));
     setStatus(streamId, 'streaming', 'streaming');
     log(streamId, 'send',
         `→ tts.request  voice=${params.voice}  lang=${params.language}  ` +
-        `speed=${params.speed}  chars=${params.text.length}`);
+        `speed=${params.speed}  epochs=${params.epochs != null ? params.epochs : 'default'}  ` +
+        `digitPron=${params.digitPronunciation || 'auto'}  hint=${params.digitHint || '—'}  ` +
+        `chars=${params.text.length}`);
   };
 
   ws.onmessage = (ev) => {
@@ -804,14 +833,20 @@ function runStream(streamId, params, onComplete) {
       const sincePart = (sinceP === null || sinceP === undefined)
         ? '' : `  since_prev=${sinceP.toFixed(0)}ms`;
       const audSec   = (m.chunk_audio_sec ?? ((m.chunk_audio_ms ?? 0)/1000)).toFixed(3);
+      const ep = (m.epochs !== undefined && m.epochs !== null) ? `  epochs=${m.epochs}` : '';
       log(streamId, 'chunk',
-        `chunk[${m.chunk_index}]  ${wallPart}${sincePart}  ` +
+        `chunk[${m.chunk_index}]  ${wallPart}${sincePart}${ep}  ` +
         `audio=${audSec}s  text="${preview}${(m.chunk_text||'').length > 50 ? '…' : ''}"`);
 
       if (streamId === playStreamId) playWavBase64(m.delta);
     }
     else if (m.type === 'response.audio.done') {
       const wall = performance.now() - state.tSend;
+      const efc = m.epochs_first_chunk;
+      const erc = m.epochs_rest_chunk;
+      const epochPart = (efc !== undefined && erc !== undefined)
+        ? `  epochs_fc=${efc}  epochs_rest=${erc}`
+        : '';
       setCell(streamId, 'total_audio', m.total_audio_ms ?? 0);
       setCell(streamId, 'server_wall', (m.total_gen_ms ?? 0).toFixed(0));
       setCell(streamId, 'client_wall', wall.toFixed(0));
@@ -823,7 +858,7 @@ function runStream(streamId, params, onComplete) {
       log(streamId, 'ok',
         `done  chunks=${m.total_chunks}  audio=${m.total_audio_ms}ms  ` +
         `server_wall=${(m.total_gen_ms ?? 0).toFixed(0)}ms  ` +
-        `client_wall=${wall.toFixed(0)}ms  rtf=${rtf}`);
+        `client_wall=${wall.toFixed(0)}ms  rtf=${rtf}${epochPart}`);
       try { ws.close(); } catch {}
       onComplete(streamId, true);
     }
@@ -883,10 +918,21 @@ async function startRun() {
   const voice       = $('voice').value.trim();
   const language    = $('language').value;
   const speed       = parseFloat($('speed').value) || 1.0;
+  const epochsRaw   = $('epochs').value.trim();
+  let epochsParam   = null;
+  if (epochsRaw !== '') {
+    epochsParam = parseInt(epochsRaw, 10);
+    if (!Number.isFinite(epochsParam) || epochsParam < 1 || epochsParam > 128) {
+      alert('Epochs must be an integer from 1 to 128, or leave empty for server defaults.');
+      return;
+    }
+  }
   const concurrent  = Math.max(1, parseInt($('concurrent').value, 10) || 1);
   const streamDelay = Math.max(0, parseFloat($('streamDelay').value) || 0);
   const text        = $('text').value;
   const hq          = $('hq').value === '1';
+  const digitPronunciation = $('digitPronunciation').value.trim();
+  const digitHint        = $('digitHint').value.trim();
   playStreamId      = Math.min(concurrent, Math.max(1, parseInt($('playStream').value, 10) || 1));
 
   if (!url || !text) {
@@ -924,11 +970,14 @@ async function startRun() {
 
   log(0, 'send',
       `── Run start  N=${concurrent}  delay=${streamDelay}s  voice=${voice}  ` +
-      `lang=${language}  speed=${speed}  chars=${text.length}  url=${url}  ` +
-      `play=stream${playStreamId} ──`);
+      `lang=${language}  speed=${speed}  epochs=${epochsParam != null ? epochsParam : 'default'}  ` +
+      `chars=${text.length}  url=${url}  play=stream${playStreamId} ──`);
 
   let doneCount = 0;
-  const params  = { url, voice, language, speed, text, high_quality: hq };
+  const params  = {
+    url, voice, language, speed, text, high_quality: hq, epochs: epochsParam,
+    digitPronunciation, digitHint,
+  };
   const onComplete = () => {
     doneCount++;
     $('streamsDoneCount').textContent = doneCount;

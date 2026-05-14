@@ -39,6 +39,7 @@ from .config import (
     USE_CUDNN_BENCH,
     USE_TF32,
 )
+from .digit_to_words import get_digit_to_word_service
 from .voice_profiles import VoiceEmbedding
 
 log = logging.getLogger("omnivoice.worker")
@@ -452,6 +453,9 @@ def worker_generate(
     languages:    Optional[list[Optional[str]]] = None,
     voice_names:  Optional[list[Optional[str]]] = None,
     speeds:       Optional[list[Optional[float]]] = None,
+    digit_words_langs: Optional[list[Optional[str]]] = None,
+    digit_words_hints: Optional[list[Optional[str]]] = None,
+    digit_pronunciations: Optional[list[Optional[str]]] = None,
 ) -> tuple[list[bytes], float]:
     """Batch generation — one ``model.generate(text=[…])`` call.
 
@@ -464,6 +468,9 @@ def worker_generate(
             fall back to the worker's default voice.
         speeds: Optional per-text speaking-speed multiplier (0.25–3.0).
             ``None`` entries use the model's natural duration estimation.
+        digit_words_langs: Per-text legacy digit locale (same codes as pronunciation).
+        digit_words_hints: Per-text hint (e.g. ``hinglish``).
+        digit_pronunciations: Per-text ``digit_pronunciation`` (preferred explicit control).
 
     Returns:
         ``(wav_bytes_list, generation_ms)``
@@ -472,6 +479,26 @@ def worker_generate(
 
     if _model is None or not _prompts:
         raise RuntimeError("Worker is not initialised. Call worker_init first.")
+
+    n = len(texts)
+    d_langs = list(digit_words_langs or [])[:n]
+    d_hints = list(digit_words_hints or [])[:n]
+    while len(d_langs) < n:
+        d_langs.append(None)
+    while len(d_hints) < n:
+        d_hints.append(None)
+    d_pros = list(digit_pronunciations or [])[:n]
+    while len(d_pros) < n:
+        d_pros.append(None)
+    texts = [
+        get_digit_to_word_service().normalize_for_tts(
+            t,
+            digit_pronunciation=dp,
+            digit_words_lang=dl,
+            digit_words_hint=dh,
+        )
+        for t, dl, dh, dp in zip(texts, d_langs, d_hints, d_pros)
+    ]
 
     cfg = OmniVoiceGenerationConfig(**cfg_dict)
 

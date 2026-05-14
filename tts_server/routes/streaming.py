@@ -5,8 +5,12 @@ Each WebSocket message is a JSON object::
     {
       "type":     "tts.request",
       "text":     "<your text>",
-      "language": "en",        // optional
-      "voice":    "ajay"       // optional — must be preloaded
+      "language": "en",              // optional
+      "voice":    "ajay",           // optional — must be preloaded
+      "epochs":   16,                // optional — diffusion num_step (alias: inference_steps)
+      "digit_words_lang": "hi",     // optional — legacy; prefer digit_pronunciation
+      "digit_words_hint": "hinglish",  // optional — English digits in Indic/SEA text
+      "digit_pronunciation": "ta"   // optional — ISO / alias for how digits are spoken
     }
 
 ``language`` is optional (defaults to the server's ``OMNIVOICE_LANGUAGE``
@@ -16,7 +20,9 @@ and must be one of the profiles preloaded via ``OMNIVOICE_VOICE_PROFILES``.
 Latency strategy (see top-level docs)
 ─────────────────────────────────────
 1. **Aggressive first-chunk text split** (~25 chars).
-2. **Few diffusion steps for the first chunk** (FIRST_CHUNK_STEPS, default 4).
+2. **Diffusion steps for the first chunk** (FIRST_CHUNK_STEPS, default 16),
+   unless the client sends ``epochs`` / ``inference_steps`` (same ``num_step``
+   for every chunk, clamped server-side).
 3. **Bypass the batch timeout** for chunk 0 via ``submit_immediate``.
 4. **Pipelined generation**: while chunk N streams, chunk N+1 is generating.
 5. **Crossfade overlap** hides any audible mismatch between the fast first
@@ -37,11 +43,14 @@ from ..config import (
     CROSSFADE_MS,
     DEFAULT_LANGUAGE,
     DEFAULT_SPEED,
+    EPOCHS_MAX,
+    EPOCHS_MIN,
     FIRST_CHUNK_CFG,
     LAST_CHUNK_CFG,
     MID_CHUNK_CFG,
     SPEED_MAX,
     SPEED_MIN,
+    cfg_with_epochs,
 )
 from ..lang_utils import resolve_language
 from ..text_utils import split_first_chunk_early, split_to_chunks
@@ -86,9 +95,38 @@ def _coerce_speed(raw) -> tuple[Optional[float], Optional[str]]:
         return None, f"speed {v} is out of range [{SPEED_MIN}, {SPEED_MAX}]"
     return v, None
 
+
+def _coerce_epochs(raw) -> tuple[Optional[int], Optional[str]]:
+    """Validate client ``epochs`` / ``inference_steps`` (maps to ``num_step``)."""
+    if raw is None:
+        return None, None
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in ("", "default", "none", "auto"):
+            return None, None
+        try:
+            raw = int(s, 10)
+        except ValueError:
+            return None, f"epochs must be an integer, got {raw!r}"
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return None, f"epochs must be an integer, got {raw!r}"
+    if not (EPOCHS_MIN <= v <= EPOCHS_MAX):
+        return None, f"epochs {v} is out of range [{EPOCHS_MIN}, {EPOCHS_MAX}]"
+    return v, None
+
+
 logger = logging.getLogger("omnivoice.streaming")
 
 router = APIRouter()
+
+
+def _coerce_opt_str(raw) -> Optional[str]:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    return s or None
 
 
 @router.websocket("/ws/tts")
@@ -150,10 +188,32 @@ async def ws_tts(websocket: WebSocket):
                 continue
             if speed is None:
                 speed = DEFAULT_SPEED
+
+            digit_words_lang = _coerce_opt_str(
+                msg.get("digit_words_lang") or msg.get("digitWordsLang")
+            )
+            digit_words_hint = _coerce_opt_str(
+                msg.get("digit_words_hint") or msg.get("digitWordsHint")
+            )
+            digit_pronunciation = _coerce_opt_str(
+                msg.get("digit_pronunciation") or msg.get("digitPronunciation")
+            )
+
+            raw_epochs = msg.get("epochs")
+            if raw_epochs is None:
+                raw_epochs = msg.get("inference_steps", msg.get("inferenceSteps"))
+            epochs_opt, epochs_err = _coerce_epochs(raw_epochs)
+            if epochs_err:
+                await websocket.send_json({"type": "error", "message": epochs_err})
+                continue
+
+            fc_cfg = cfg_with_epochs(FIRST_CHUNK_CFG, epochs_opt)
+
             logger.info(
-                "WS TTS request  voice=%s  lang=%s  speed=%s  text=%.80s",
+                "WS TTS request  voice=%s  lang=%s  speed=%s  epochs=%s  text=%.80s",
                 voice, language or "auto",
                 f"{speed:.2f}" if speed is not None else "default",
+                epochs_opt if epochs_opt is not None else "default",
                 text,
             )
 
@@ -189,8 +249,11 @@ async def ws_tts(websocket: WebSocket):
             t_first_await_start = time.perf_counter()
             try:
                 first_wav, first_gen_ms = await batcher.submit_first_chunk(
-                    first_text, FIRST_CHUNK_CFG,
+                    first_text, fc_cfg,
                     language=language, voice=voice, speed=speed,
+                    digit_words_lang=digit_words_lang,
+                    digit_words_hint=digit_words_hint,
+                    digit_pronunciation=digit_pronunciation,
                 )
             except Exception as exc:
                 await websocket.send_json({"type": "error", "message": str(exc)})
@@ -235,6 +298,7 @@ async def ws_tts(websocket: WebSocket):
                 "voice":                  voice,
                 "speed":                  speed,
                 "first_chunk_latency_ms": round(first_latency_ms, 1),
+                "epochs":                 int(fc_cfg["num_step"]),
             })
 
             # NOW that the first chunk is sent, pre-submit chunk 1.
@@ -242,11 +306,15 @@ async def ws_tts(websocket: WebSocket):
             # first-chunk response would put rest-chunks in the executor
             # queue ahead of other streams' first chunks.
             if n > 1:
-                cfg_1 = LAST_CHUNK_CFG if n == 2 else MID_CHUNK_CFG
+                base_1 = LAST_CHUNK_CFG if n == 2 else MID_CHUNK_CFG
+                cfg_1 = cfg_with_epochs(base_1, epochs_opt)
                 prefetch_task = asyncio.create_task(
                     batcher.submit(
                         all_chunks[1], cfg_1,
                         language=language, voice=voice, speed=speed,
+                        digit_words_lang=digit_words_lang,
+                        digit_words_hint=digit_words_hint,
+                        digit_pronunciation=digit_pronunciation,
                     )
                 )
 
@@ -264,20 +332,30 @@ async def ws_tts(websocket: WebSocket):
                         await websocket.send_json({"type": "error", "message": str(exc)})
                         break
                 else:
-                    cfg_i = LAST_CHUNK_CFG if is_last else MID_CHUNK_CFG
+                    base_i = LAST_CHUNK_CFG if is_last else MID_CHUNK_CFG
+                    cfg_i = cfg_with_epochs(base_i, epochs_opt)
                     wav_bytes = await batcher.submit(
                         all_chunks[i], cfg_i,
                         language=language, voice=voice, speed=speed,
+                        digit_words_lang=digit_words_lang,
+                        digit_words_hint=digit_words_hint,
+                        digit_pronunciation=digit_pronunciation,
                     )
                 gen_end = time.perf_counter()
 
                 prefetch_task = None
                 if i + 1 < n:
-                    cfg_next = LAST_CHUNK_CFG if (i + 1 == n - 1) else MID_CHUNK_CFG
+                    base_next = (
+                        LAST_CHUNK_CFG if (i + 1 == n - 1) else MID_CHUNK_CFG
+                    )
+                    cfg_next = cfg_with_epochs(base_next, epochs_opt)
                     prefetch_task = asyncio.create_task(
                         batcher.submit(
                             all_chunks[i + 1], cfg_next,
                             language=language, voice=voice, speed=speed,
+                            digit_words_lang=digit_words_lang,
+                            digit_words_hint=digit_words_hint,
+                            digit_pronunciation=digit_pronunciation,
                         )
                     )
 
@@ -292,6 +370,12 @@ async def ws_tts(websocket: WebSocket):
                 chunk_audio_ms      = len(audio) / sr_eff * 1000.0
                 cumulative_audio_ms += chunk_audio_ms
                 prev_gen_end = gen_end
+
+                rest_epoch_cfg = cfg_with_epochs(
+                    LAST_CHUNK_CFG if is_last else MID_CHUNK_CFG,
+                    epochs_opt,
+                )
+                epochs_this = int(rest_epoch_cfg["num_step"])
 
                 logger.info(
                     "CHUNK[%d]  wall=%.1fms  since_prev=%.1fms  since_req=%.1fms  "
@@ -319,6 +403,7 @@ async def ws_tts(websocket: WebSocket):
                     "language":             language or "auto",
                     "voice":                voice,
                     "speed":                speed,
+                    "epochs":               epochs_this,
                 })
 
             tail = xfader.flush()
@@ -331,6 +416,12 @@ async def ws_tts(websocket: WebSocket):
             total_audio_ms = round(total_samples / sample_rate * 1000)
             total_wall_ms  = round((time.perf_counter() - t_req) * 1000, 1)
 
+            epochs_first = int(fc_cfg["num_step"])
+            if n <= 1:
+                epochs_rest = epochs_first
+            else:
+                epochs_rest = int(cfg_with_epochs(MID_CHUNK_CFG, epochs_opt)["num_step"])
+
             await websocket.send_json({
                 "type":                   "response.audio.done",
                 "total_chunks":           n,
@@ -340,13 +431,16 @@ async def ws_tts(websocket: WebSocket):
                 "language":               language or "auto",
                 "voice":                  voice,
                 "speed":                  speed,
+                "epochs_first_chunk":     epochs_first,
+                "epochs_rest_chunk":      epochs_rest,
             })
             logger.info(
                 "Done.  chunks=%d  audio=%dms  wall=%.0fms  first_chunk=%.0fms  "
-                "voice=%s  lang=%s  speed=%s",
+                "voice=%s  lang=%s  speed=%s  epochs_fc=%d  epochs_rest=%d",
                 n, total_audio_ms, total_wall_ms, first_latency_ms or 0,
                 voice, language or "auto",
                 f"{speed:.2f}" if speed is not None else "default",
+                epochs_first, epochs_rest,
             )
 
     except WebSocketDisconnect:

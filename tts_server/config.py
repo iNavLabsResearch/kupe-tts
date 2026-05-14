@@ -188,9 +188,9 @@ FIRST_CHUNK_STEPS:    int   = max(1, int(os.getenv("OMNIVOICE_FIRST_CHUNK_STEPS"
 FIRST_CHUNK_GUIDANCE: float = float(os.getenv("OMNIVOICE_FIRST_CHUNK_GUIDANCE", "1.0"))
 
 # Rest-chunk (mid + last) diffusion steps.  Lower → faster GPU calls → lower
-# max FC latency when the GPU is busy with a rest-chunk.  Quality impact is
-# typically small for 6-8 steps.  Previous default was 16.
-REST_CHUNK_STEPS: int = max(1, int(os.getenv("OMNIVOICE_REST_CHUNK_STEPS", "8")))
+# max FC latency when the GPU is busy with a rest-chunk.  Default 16 matches
+# a solid quality / speed trade-off; tune down (e.g. 8) for busier GPUs.
+REST_CHUNK_STEPS: int = max(1, int(os.getenv("OMNIVOICE_REST_CHUNK_STEPS", "16")))
 
 # ---------------------------------------------------------------------------
 # Generation config dicts (plain dicts for safe pickling across processes)
@@ -227,3 +227,21 @@ LAST_CHUNK_CFG: dict = dict(
     position_temperature=5.0,
     class_temperature=0.0,
 )
+
+# ---------------------------------------------------------------------------
+# Client-overridable diffusion depth (``num_step`` in generation config)
+# ---------------------------------------------------------------------------
+EPOCHS_MIN: int = 1
+EPOCHS_MAX: int = 128
+
+
+def cfg_with_epochs(base: dict, epochs: int | None) -> dict:
+    """Shallow copy of ``base`` with optional ``num_step`` (clamped).
+
+    API / WebSocket field name is ``epochs``; it maps to OmniVoice
+    ``num_step`` (iterative decoding / diffusion depth).
+    """
+    cfg = dict(base)
+    if epochs is not None:
+        cfg["num_step"] = max(EPOCHS_MIN, min(EPOCHS_MAX, int(epochs)))
+    return cfg

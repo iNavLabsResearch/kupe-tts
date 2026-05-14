@@ -16,8 +16,8 @@ Maximum first-chunk latency
   ``remaining time of the currently-running GPU call + FC generation time``
 
 To keep this low, rest-chunks are capped at ``MAX_REST_BATCH`` items per
-dispatch (default 1) and use fewer diffusion steps (``REST_CHUNK_STEPS``,
-default 8 vs 16), so each GPU call finishes quickly and the scheduler can
+dispatch (default 1) and use ``REST_CHUNK_STEPS`` diffusion steps (default
+16, configurable), so each GPU call finishes predictably and the scheduler can
 re-check for incoming FC items.
 """
 
@@ -49,6 +49,9 @@ class _SynthReq:
     future:   asyncio.Future
     is_fc:    bool  = False
     t_submit: float = field(default_factory=time.perf_counter)
+    digit_words_lang:  Optional[str] = None
+    digit_words_hint: Optional[str] = None
+    digit_pronunciation: Optional[str] = None
 
 
 @dataclass(order=True)
@@ -107,6 +110,9 @@ class DynamicBatcher:
         language: Optional[str] = None,
         voice: Optional[str] = None,
         speed: Optional[float] = None,
+        digit_words_lang: Optional[str] = None,
+        digit_words_hint: Optional[str] = None,
+        digit_pronunciation: Optional[str] = None,
     ) -> bytes:
         """Enqueue a rest-chunk request (normal priority)."""
         loop = asyncio.get_running_loop()
@@ -115,7 +121,10 @@ class DynamicBatcher:
         await self._pq.put(_PrioItem(
             _PRIO_REST, self._seq,
             _SynthReq(text=text, cfg=cfg, language=language, voice=voice,
-                      speed=speed, future=fut, is_fc=False),
+                      speed=speed, future=fut, is_fc=False,
+                      digit_words_lang=digit_words_lang,
+                      digit_words_hint=digit_words_hint,
+                      digit_pronunciation=digit_pronunciation),
         ))
         return await fut
 
@@ -126,6 +135,9 @@ class DynamicBatcher:
         language: Optional[str] = None,
         voice: Optional[str] = None,
         speed: Optional[float] = None,
+        digit_words_lang: Optional[str] = None,
+        digit_words_hint: Optional[str] = None,
+        digit_pronunciation: Optional[str] = None,
     ) -> tuple[bytes, float]:
         """Submit a first-chunk request with highest priority.
 
@@ -141,7 +153,10 @@ class DynamicBatcher:
         await self._pq.put(_PrioItem(
             _PRIO_FC, self._seq,
             _SynthReq(text=text, cfg=cfg, language=language, voice=voice,
-                      speed=speed, future=fut, is_fc=True),
+                      speed=speed, future=fut, is_fc=True,
+                      digit_words_lang=digit_words_lang,
+                      digit_words_hint=digit_words_hint,
+                      digit_pronunciation=digit_pronunciation),
         ))
         return await fut
 
@@ -152,10 +167,16 @@ class DynamicBatcher:
         language: Optional[str] = None,
         voice: Optional[str] = None,
         speed: Optional[float] = None,
+        digit_words_lang: Optional[str] = None,
+        digit_words_hint: Optional[str] = None,
+        digit_pronunciation: Optional[str] = None,
     ) -> tuple[bytes, float]:
         """Convenience wrapper — routes through the FC priority path."""
         return await self.submit_first_chunk(
             text, cfg, language=language, voice=voice, speed=speed,
+            digit_words_lang=digit_words_lang,
+            digit_words_hint=digit_words_hint,
+            digit_pronunciation=digit_pronunciation,
         )
 
     # ------------------------------------------------------------------
@@ -237,6 +258,9 @@ class DynamicBatcher:
         languages = [r.language for r in batch]
         voices    = [r.voice for r in batch]
         speeds    = [r.speed for r in batch]
+        d_langs   = [r.digit_words_lang for r in batch]
+        d_hints   = [r.digit_words_hint for r in batch]
+        d_pros    = [r.digit_pronunciation for r in batch]
         cfg       = batch[0].cfg
 
         logger.info(
@@ -249,7 +273,7 @@ class DynamicBatcher:
         try:
             wav_list, gen_ms = await loop.run_in_executor(
                 self._executor, worker_generate,
-                texts, cfg, languages, voices, speeds,
+                texts, cfg, languages, voices, speeds, d_langs, d_hints, d_pros,
             )
             self.total_requests += len(batch)
             self.total_batches  += 1
@@ -280,6 +304,9 @@ class DynamicBatcher:
         languages = [r.language for r in ordered]
         voices    = [r.voice for r in ordered]
         speeds    = [r.speed for r in ordered]
+        d_langs   = [r.digit_words_lang for r in ordered]
+        d_hints   = [r.digit_words_hint for r in ordered]
+        d_pros    = [r.digit_pronunciation for r in ordered]
         cfg       = ordered[0].cfg
         avg_q     = sum(
             (time.perf_counter() - r.t_submit) * 1000 for r in ordered
@@ -295,7 +322,7 @@ class DynamicBatcher:
         try:
             wav_list, gen_ms = await loop.run_in_executor(
                 self._executor, worker_generate,
-                texts, cfg, languages, voices, speeds,
+                texts, cfg, languages, voices, speeds, d_langs, d_hints, d_pros,
             )
             self.total_requests += len(ordered)
             self.total_batches  += 1

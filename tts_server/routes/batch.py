@@ -8,7 +8,13 @@ import time
 from fastapi import APIRouter, HTTPException, Request
 
 from ..audio_utils import b64_encode, wav_bytes_to_np
-from ..config import DEFAULT_LANGUAGE, DEFAULT_SPEED, LAST_CHUNK_CFG, MID_CHUNK_CFG
+from ..config import (
+    DEFAULT_LANGUAGE,
+    DEFAULT_SPEED,
+    LAST_CHUNK_CFG,
+    MID_CHUNK_CFG,
+    cfg_with_epochs,
+)
 from ..lang_utils import resolve_language
 from ..schemas import BatchTTSItem, BatchTTSRequest, BatchTTSResponse
 
@@ -25,6 +31,7 @@ async def batch_tts(req: BatchTTSRequest, request: Request):
     Optional fields in the JSON body:
       - ``language``: ISO 639 code for the synthesised speech.
       - ``voice``:    Voice profile name (must be preloaded at startup).
+      - ``epochs`` / ``inference_steps``: optional diffusion depth (``num_step``).
     """
     if not req.texts:
         raise HTTPException(400, "'texts' list cannot be empty.")
@@ -44,7 +51,8 @@ async def batch_tts(req: BatchTTSRequest, request: Request):
             f"{sorted(available_voices.keys())}",
         )
 
-    cfg = LAST_CHUNK_CFG if req.use_high_quality else MID_CHUNK_CFG
+    cfg_base = LAST_CHUNK_CFG if req.use_high_quality else MID_CHUNK_CFG
+    cfg = cfg_with_epochs(cfg_base, req.epochs)
     language = resolve_language(req.language or DEFAULT_LANGUAGE)
     speed    = req.speed if req.speed is not None else DEFAULT_SPEED
     batches_before = batcher.total_batches
@@ -52,7 +60,16 @@ async def batch_tts(req: BatchTTSRequest, request: Request):
 
     tasks = [
         asyncio.create_task(
-            batcher.submit(text, cfg, language=language, voice=voice, speed=speed)
+            batcher.submit(
+                text,
+                cfg,
+                language=language,
+                voice=voice,
+                speed=speed,
+                digit_words_lang=req.digit_words_lang,
+                digit_words_hint=req.digit_words_hint,
+                digit_pronunciation=req.digit_pronunciation,
+            )
         )
         for text in req.texts
     ]
@@ -79,4 +96,5 @@ async def batch_tts(req: BatchTTSRequest, request: Request):
         language=language or "auto",
         voice=voice,
         speed=speed,
+        epochs=int(cfg["num_step"]),
     )
