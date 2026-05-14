@@ -307,11 +307,23 @@
   <div class="panel">
     <h2>Configuration</h2>
     <div class="form-grid">
-      <label>Server URL
-        <input id="url" value="ws://localhost:8000/ws/tts" />
+      <label class="text-row">API base URL (HTTP or HTTPS — REST + WebSocket derived from this)
+        <input id="apiBase" type="text" placeholder="http://localhost:8000" spellcheck="false" autocomplete="off" />
+      </label>
+      <label>WebSocket URL (auto-filled; edit if you use a separate WS host)
+        <input id="url" spellcheck="false" autocomplete="off" />
       </label>
       <label>Voice
-        <input id="voice" value="shanti" placeholder="ajay / shanti / soham …" />
+        <select id="voiceSelect"></select>
+      </label>
+      <label>First-chunk diffusion steps (empty = server default)
+        <input id="epochsFc" type="number" min="1" max="128" step="1" placeholder="default" />
+      </label>
+      <label>Rest-chunk steps — mid + last chunks (empty = server default)
+        <input id="epochsRest" type="number" min="1" max="128" step="1" placeholder="default" />
+      </label>
+      <label title="When both fields above are empty, this value applies to first and rest chunks.">Legacy epochs (both)
+        <input id="epochs" type="number" min="1" max="128" step="1" placeholder="default" />
       </label>
       <label>Language
         <select id="language">
@@ -339,9 +351,6 @@
       </label>
       <label>Speed (0.25 – 3.0)
         <input id="speed" type="number" min="0.25" max="3" step="0.05" value="1.00" />
-      </label>
-      <label title="Diffusion / decoding steps (OmniVoice num_step). Empty = server default (16 for first and rest chunks unless env overrides).">Epochs (diffusion steps)
-        <input id="epochs" type="number" min="1" max="128" step="1" placeholder="default" />
       </label>
       <label>Concurrent streams
         <input id="concurrent" type="number" min="1" max="32" value="5" />
@@ -389,7 +398,37 @@
       <button id="stop" class="secondary" disabled>■  Stop</button>
       <button id="reset" class="secondary">Reset to sample</button>
       <button id="loadFile" class="secondary">Reload sample_text.txt</button>
+      <button id="refreshVoices" class="secondary" type="button">Refresh voices</button>
       <span id="hintLine" class="hint" style="margin-left:auto;"></span>
+    </div>
+  </div>
+
+  <!-- ============================================================== -->
+  <!-- NEW PERSONA (hot-load, no server restart)                     -->
+  <!-- ============================================================== -->
+  <div class="panel">
+    <h2>New persona — upload reference clip</h2>
+    <p class="subtitle" style="margin-top:-6px;">
+      POSTs to <code style="font-size:12px;">/api/voices</code> on your API base. Saves <code>&lt;name&gt;_ref.json</code> + audio under
+      <code>voice_reference/</code> and hot-loads embeddings into every GPU worker.
+    </p>
+    <div class="form-grid">
+      <label>Persona id (letters, digits, underscore)
+        <input id="newVoiceName" placeholder="e.g. ravi" autocomplete="off" />
+      </label>
+      <label>Reference transcript (aligned with the clip)
+        <input id="newVoiceRefText" placeholder="What the speaker says in the reference audio…" />
+      </label>
+      <label>Default language (optional, ISO or empty)
+        <input id="newVoiceLang" placeholder="auto / en / hi …" />
+      </label>
+      <label>Reference audio file
+        <input id="newVoiceFile" type="file" accept=".wav,.mp3,.flac,.ogg,.webm,.m4a,audio/*" />
+      </label>
+    </div>
+    <div class="button-row">
+      <button id="createVoice" type="button">Create persona &amp; hot-load</button>
+      <span id="createVoiceStatus" class="hint"></span>
     </div>
   </div>
 
@@ -528,6 +567,112 @@ const $ = (id) => document.getElementById(id);
 const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, c => (
   { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]
 ));
+
+const LS_API_BASE = 'omnivoice_demo_api_base';
+const LS_WS_URL   = 'omnivoice_demo_ws_url';
+
+function apiBaseTrim() {
+  return ($('apiBase').value || '').trim().replace(/\/$/, '');
+}
+
+/** Build default ws(s)://host/ws/tts from http(s) API origin. */
+function originToDefaultWs(origin) {
+  let o = (origin || '').trim().replace(/\/$/, '');
+  if (!o) o = 'http://localhost:8000';
+  const ws = o.replace(/^http:/i, 'ws:').replace(/^https:/i, 'wss:');
+  return ws + (/\/ws\/tts$/i.test(ws) ? '' : '/ws/tts');
+}
+
+function syncWsFromApiBase() {
+  $('url').value = originToDefaultWs(apiBaseTrim());
+}
+
+function saveApiPrefs() {
+  try {
+    localStorage.setItem(LS_API_BASE, apiBaseTrim());
+    localStorage.setItem(LS_WS_URL, ($('url').value || '').trim());
+  } catch (_) {}
+}
+
+async function refreshVoiceList() {
+  const base = apiBaseTrim();
+  const hint = $('hintLine');
+  const sel = $('voiceSelect');
+  const prev = sel.value;
+  try {
+    const r = await fetch(base + '/api/voices', { cache: 'no-store' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    const names = (j.names && j.names.length) ? j.names : (j.loaded_names || []);
+    sel.innerHTML = '';
+    if (!names.length) {
+      const o = document.createElement('option');
+      o.value = 'shanti';
+      o.textContent = 'shanti (no voices reported — check server)';
+      sel.appendChild(o);
+    } else {
+      for (const n of names) {
+        const o = document.createElement('option');
+        o.value = n;
+        o.textContent = n + (j.default_voice === n ? ' (default)' : '');
+        sel.appendChild(o);
+      }
+    }
+    if (prev && [...sel.options].some((op) => op.value === prev)) sel.value = prev;
+    else if (j.default_voice && [...sel.options].some((op) => op.value === j.default_voice)) {
+      sel.value = j.default_voice;
+    }
+    hint.textContent = `Voices: ${names.length} from ${base}/api/voices`;
+  } catch (e) {
+    hint.textContent = `Could not fetch voices (${e.message})`;
+    sel.innerHTML = '';
+    const o = document.createElement('option');
+    o.value = 'shanti';
+    o.textContent = 'shanti (fallback)';
+    sel.appendChild(o);
+  }
+}
+
+async function createPersona() {
+  const status = $('createVoiceStatus');
+  status.textContent = '';
+  const name = $('newVoiceName').value.trim();
+  const refText = $('newVoiceRefText').value.trim();
+  const language = $('newVoiceLang').value.trim();
+  const fileIn = $('newVoiceFile');
+  if (!name || !refText) {
+    alert('Persona id and reference transcript are required.');
+    return;
+  }
+  if (!fileIn.files || !fileIn.files[0]) {
+    alert('Choose a reference audio file.');
+    return;
+  }
+  const base = apiBaseTrim();
+  const fd = new FormData();
+  fd.append('name', name);
+  fd.append('ref_text', refText);
+  fd.append('language', language);
+  fd.append('file', fileIn.files[0], fileIn.files[0].name);
+  status.textContent = 'Uploading…';
+  try {
+    const r = await fetch(base + '/api/voices', { method: 'POST', body: fd });
+    const txt = await r.text();
+    let j = null;
+    try { j = JSON.parse(txt); } catch { /* plain text error */ }
+    if (!r.ok) {
+      const detail = j && (j.detail || j.message);
+      const msg = typeof detail === 'string' ? detail : (detail ? JSON.stringify(detail) : txt);
+      throw new Error(msg || `HTTP ${r.status}`);
+    }
+    const pids = (j.worker_pids || []).join(', ');
+    status.textContent = `Hot-loaded “${j.name}”. Workers touched: ${pids || '—'}`;
+    await refreshVoiceList();
+    if (j.name) $('voiceSelect').value = j.name;
+  } catch (e) {
+    status.textContent = 'Error: ' + e.message;
+  }
+}
 
 function fmtNum(v) {
   if (v === null || v === undefined || v === "") return "—";
@@ -791,6 +936,8 @@ function runStream(streamId, params, onComplete) {
     };
     if (params.language && params.language !== 'auto') msg.language = params.language;
     if (params.high_quality) msg.use_high_quality = true;
+    if (params.epochsFc != null) msg.epochs_fc = params.epochsFc;
+    if (params.epochsRest != null) msg.epochs_rest = params.epochsRest;
     if (params.epochs != null) msg.epochs = params.epochs;
     if (params.digitPronunciation) msg.digit_pronunciation = params.digitPronunciation;
     if (params.digitHint) msg.digit_words_hint = params.digitHint;
@@ -798,7 +945,9 @@ function runStream(streamId, params, onComplete) {
     setStatus(streamId, 'streaming', 'streaming');
     log(streamId, 'send',
         `→ tts.request  voice=${params.voice}  lang=${params.language}  ` +
-        `speed=${params.speed}  epochs=${params.epochs != null ? params.epochs : 'default'}  ` +
+        `speed=${params.speed}  epochs_fc=${params.epochsFc != null ? params.epochsFc : '∅'}  ` +
+        `epochs_rest=${params.epochsRest != null ? params.epochsRest : '∅'}  ` +
+        `epochs_legacy=${params.epochs != null ? params.epochs : '∅'}  ` +
         `digitPron=${params.digitPronunciation || 'auto'}  hint=${params.digitHint || '—'}  ` +
         `chars=${params.text.length}`);
   };
@@ -915,17 +1064,22 @@ function stopWallTimer() {
 
 async function startRun() {
   const url         = $('url').value.trim();
-  const voice       = $('voice').value.trim();
+  const voice       = $('voiceSelect').value.trim();
   const language    = $('language').value;
   const speed       = parseFloat($('speed').value) || 1.0;
-  const epochsRaw   = $('epochs').value.trim();
-  let epochsParam   = null;
-  if (epochsRaw !== '') {
-    epochsParam = parseInt(epochsRaw, 10);
-    if (!Number.isFinite(epochsParam) || epochsParam < 1 || epochsParam > 128) {
-      alert('Epochs must be an integer from 1 to 128, or leave empty for server defaults.');
-      return;
-    }
+  const parseEp = (id) => {
+    const raw = $(id).value.trim();
+    if (raw === '') return null;
+    const v = parseInt(raw, 10);
+    if (!Number.isFinite(v) || v < 1 || v > 128) return NaN;
+    return v;
+  };
+  const epochsFc   = parseEp('epochsFc');
+  const epochsRest = parseEp('epochsRest');
+  const epochsLeg  = parseEp('epochs');
+  if (Number.isNaN(epochsFc) || Number.isNaN(epochsRest) || Number.isNaN(epochsLeg)) {
+    alert('Diffusion steps must be integers from 1 to 128, or leave fields empty for server defaults.');
+    return;
   }
   const concurrent  = Math.max(1, parseInt($('concurrent').value, 10) || 1);
   const streamDelay = Math.max(0, parseFloat($('streamDelay').value) || 0);
@@ -936,7 +1090,7 @@ async function startRun() {
   playStreamId      = Math.min(concurrent, Math.max(1, parseInt($('playStream').value, 10) || 1));
 
   if (!url || !text) {
-    alert('Server URL and text are required.');
+    alert('WebSocket URL and text are required.');
     return;
   }
   if (speed < 0.25 || speed > 3.0) {
@@ -968,14 +1122,16 @@ async function startRun() {
   runStartedAt = performance.now();
   startWallTimer();
 
+  const epLog = `fc=${epochsFc != null ? epochsFc : '∅'} rest=${epochsRest != null ? epochsRest : '∅'} legacy=${epochsLeg != null ? epochsLeg : '∅'}`;
   log(0, 'send',
       `── Run start  N=${concurrent}  delay=${streamDelay}s  voice=${voice}  ` +
-      `lang=${language}  speed=${speed}  epochs=${epochsParam != null ? epochsParam : 'default'}  ` +
+      `lang=${language}  speed=${speed}  ${epLog}  ` +
       `chars=${text.length}  url=${url}  play=stream${playStreamId} ──`);
 
   let doneCount = 0;
   const params  = {
-    url, voice, language, speed, text, high_quality: hq, epochs: epochsParam,
+    url, voice, language, speed, text, high_quality: hq,
+    epochs: epochsLeg, epochsFc, epochsRest,
     digitPronunciation, digitHint,
   };
   const onComplete = () => {
@@ -1055,7 +1211,24 @@ async function loadSampleFile() {
 window.addEventListener('DOMContentLoaded', () => {
   $('text').value = SAMPLE_TEXT;
   buildTable(parseInt($('concurrent').value, 10) || 3);
+
+  const savedBase = localStorage.getItem(LS_API_BASE);
+  const savedWs = localStorage.getItem(LS_WS_URL);
+  $('apiBase').value = (savedBase && savedBase.trim()) ? savedBase.trim() : 'http://localhost:8000';
+  if (savedWs && savedWs.trim()) $('url').value = savedWs.trim();
+  else syncWsFromApiBase();
+
+  $('apiBase').addEventListener('change', () => {
+    syncWsFromApiBase();
+    saveApiPrefs();
+    refreshVoiceList();
+  });
+  $('url').addEventListener('change', saveApiPrefs);
+  $('refreshVoices').addEventListener('click', () => { saveApiPrefs(); refreshVoiceList(); });
+  $('createVoice').addEventListener('click', createPersona);
+
   loadSampleFile();   // overlay with the file content if reachable
+  refreshVoiceList();
 
   $('start').addEventListener('click', startRun);
   $('stop').addEventListener('click', stopRun);

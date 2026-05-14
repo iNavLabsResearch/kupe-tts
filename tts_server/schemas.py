@@ -26,8 +26,8 @@ class BatchTTSRequest(BaseModel):
     voice:            Optional[str]             = Field(
         default=None,
         description=(
-            "Voice profile name to use (e.g. 'ajay', 'soham'). Must be one of "
-            "the profiles preloaded at server startup (see OMNIVOICE_VOICE_PROFILES). "
+            "Voice profile name to use (e.g. 'ajay', 'soham'). May be any "
+            "profile loaded at startup or hot-added via POST /api/voices. "
             "If omitted, the server's default voice is used."
         ),
     )

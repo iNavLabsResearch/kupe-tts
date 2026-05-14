@@ -425,6 +425,36 @@ def worker_init(
     log.info("Worker ready.")
 
 
+def worker_add_voice(name: str, spec: dict, model_id: str) -> int:
+    """Add or replace one voice in this worker's in-memory prompt table.
+
+    Called from the parent process via ``ProcessPoolExecutor`` after a new
+    profile lands on disk so inference can use it **without** restarting
+    the server.
+
+    Returns this process's PID so the caller can verify every worker received
+    the update.
+    """
+    import os
+
+    global _model, _prompts
+
+    if _model is None:
+        raise RuntimeError("worker_add_voice: model not initialised.")
+    if not name or not str(name).strip():
+        raise ValueError("worker_add_voice: empty voice name.")
+    name = str(name).strip()
+    _prompts[name] = _resolve_voice_prompt(_model, name, spec, model_id)
+    p = _prompts[name]
+    log.info(
+        "[%s] Hot-loaded voice  pid=%d  tokens=(%d, %d)  rms=%.4f",
+        name, os.getpid(),
+        p.ref_audio_tokens.shape[0], p.ref_audio_tokens.shape[1],
+        p.ref_rms,
+    )
+    return int(os.getpid())
+
+
 def worker_probe() -> dict:
     """No-op task used to force ``worker_init`` to complete during lifespan
     startup.  Submitting ``MAX_WORKERS`` of these in parallel guarantees every

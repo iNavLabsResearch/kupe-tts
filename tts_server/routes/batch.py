@@ -30,7 +30,7 @@ async def batch_tts(req: BatchTTSRequest, request: Request):
 
     Optional fields in the JSON body:
       - ``language``: ISO 639 code for the synthesised speech.
-      - ``voice``:    Voice profile name (must be preloaded at startup).
+      - ``voice``:    Voice profile name (startup or hot-loaded via ``POST /api/voices``).
       - ``epochs`` / ``inference_steps``: optional diffusion depth (``num_step``).
     """
     if not req.texts:

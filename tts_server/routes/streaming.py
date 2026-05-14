@@ -6,8 +6,11 @@ Each WebSocket message is a JSON object::
       "type":     "tts.request",
       "text":     "<your text>",
       "language": "en",              // optional
-      "voice":    "ajay",           // optional — must be preloaded
-      "epochs":   16,                // optional — diffusion num_step (alias: inference_steps)
+      "voice":    "ajay",           // optional — any profile known to the server (incl. hot-added)
+      "epochs":   16,                // optional — sets BOTH first- and rest-chunk steps when the
+                                     // specific keys below are omitted (alias: inference_steps)
+      "epochs_fc":   4,             // optional — first-chunk num_step only (aliases: first_chunk_epochs)
+      "epochs_rest": 12,            // optional — mid + last chunk num_step (aliases: rest_chunk_epochs)
       "digit_words_lang": "hi",     // optional — legacy; prefer digit_pronunciation
       "digit_words_hint": "hinglish",  // optional — English digits in Indic/SEA text
       "digit_pronunciation": "ta"   // optional — ISO / alias for how digits are spoken
@@ -15,17 +18,21 @@ Each WebSocket message is a JSON object::
 
 ``language`` is optional (defaults to the server's ``OMNIVOICE_LANGUAGE``
 setting).  ``voice`` is optional (defaults to ``OMNIVOICE_DEFAULT_VOICE``)
-and must be one of the profiles preloaded via ``OMNIVOICE_VOICE_PROFILES``.
+and must match a profile known to the server (startup-loaded or hot-added
+via ``POST /api/voices``).
 
 Latency strategy (see top-level docs)
 ─────────────────────────────────────
 1. **Aggressive first-chunk text split** (~25 chars).
-2. **Diffusion steps for the first chunk** (FIRST_CHUNK_STEPS, default 16),
-   unless the client sends ``epochs`` / ``inference_steps`` (same ``num_step``
-   for every chunk, clamped server-side).
-3. **Bypass the batch timeout** for chunk 0 via ``submit_immediate``.
-4. **Pipelined generation**: while chunk N streams, chunk N+1 is generating.
-5. **Crossfade overlap** hides any audible mismatch between the fast first
+2. **Diffusion steps for the first chunk** (``FIRST_CHUNK_STEPS``) unless the
+   client sends ``epochs_fc`` / ``first_chunk_epochs``, or ``epochs`` /
+   ``inference_steps`` when no per-stage override is given.
+3. **Rest-chunk steps** (``MID_CHUNK_CFG`` / ``LAST_CHUNK_CFG``) unless the client
+   sends ``epochs_rest`` / ``rest_chunk_epochs``, or ``epochs`` when that key
+   is not overridden for rest chunks.
+4. **Bypass the batch timeout** for chunk 0 via ``submit_immediate``.
+5. **Pipelined generation**: while chunk N streams, chunk N+1 is generating.
+6. **Crossfade overlap** hides any audible mismatch between the fast first
    chunk and the higher-quality chunks that follow.
 """
 
@@ -117,6 +124,69 @@ def _coerce_epochs(raw) -> tuple[Optional[int], Optional[str]]:
     return v, None
 
 
+def _epochs_field_provided(raw) -> bool:
+    """True when the client sent a value other than 'use server default' sentinels."""
+    if raw is None:
+        return False
+    if isinstance(raw, str) and raw.strip().lower() in ("", "default", "none", "auto"):
+        return False
+    return True
+
+
+def _resolve_fc_rest_epochs(msg: dict) -> tuple[Optional[int], Optional[int], Optional[str]]:
+    """Derive first-chunk and rest-chunk ``num_step`` overrides from the WS payload.
+
+    Precedence:
+      * ``epochs_fc`` / ``first_chunk_epochs`` applies to chunk 0 only.
+      * ``epochs_rest`` / ``rest_chunk_epochs`` / ``mid_chunk_epochs`` applies to chunks ≥1.
+      * ``epochs`` / ``inference_steps`` fills whichever of the above was **not** explicitly set.
+    """
+    raw_fc = (
+        msg.get("epochs_fc")
+        or msg.get("first_chunk_epochs")
+        or msg.get("firstChunkEpochs")
+    )
+    raw_rest = (
+        msg.get("epochs_rest")
+        or msg.get("rest_chunk_epochs")
+        or msg.get("restChunkEpochs")
+        or msg.get("mid_chunk_epochs")
+    )
+    raw_legacy = msg.get("epochs")
+    if raw_legacy is None:
+        raw_legacy = msg.get("inference_steps", msg.get("inferenceSteps"))
+
+    fc_opt: Optional[int]
+    rest_opt: Optional[int]
+
+    if _epochs_field_provided(raw_fc):
+        fc_opt, err = _coerce_epochs(raw_fc)
+        if err:
+            return None, None, err
+    else:
+        fc_opt = None
+
+    if _epochs_field_provided(raw_rest):
+        rest_opt, err = _coerce_epochs(raw_rest)
+        if err:
+            return None, None, err
+    else:
+        rest_opt = None
+
+    leg_opt: Optional[int] = None
+    if _epochs_field_provided(raw_legacy):
+        leg_opt, err = _coerce_epochs(raw_legacy)
+        if err:
+            return None, None, err
+
+    if fc_opt is None:
+        fc_opt = leg_opt
+    if rest_opt is None:
+        rest_opt = leg_opt
+
+    return fc_opt, rest_opt, None
+
+
 logger = logging.getLogger("omnivoice.streaming")
 
 router = APIRouter()
@@ -135,8 +205,7 @@ async def ws_tts(websocket: WebSocket):
     logger.info("WS connected: %s", websocket.client)
     batcher = websocket.app.state.batcher
     sample_rate: int = getattr(websocket.app.state, "sample_rate", 24_000)
-    available_voices: dict = getattr(websocket.app.state, "voice_profiles", {})
-    default_voice:    str  = getattr(websocket.app.state, "default_voice", "")
+    default_voice: str = getattr(websocket.app.state, "default_voice", "")
 
     try:
         while True:
@@ -163,6 +232,8 @@ async def ws_tts(websocket: WebSocket):
             if not text:
                 await websocket.send_json({"type": "error", "message": "Empty text."})
                 continue
+
+            available_voices: dict = getattr(websocket.app.state, "voice_profiles", {}) or {}
 
             # Language: client sends ISO code, name, or 'auto' (None = auto).
             raw_lang = msg.get("language")
@@ -199,21 +270,19 @@ async def ws_tts(websocket: WebSocket):
                 msg.get("digit_pronunciation") or msg.get("digitPronunciation")
             )
 
-            raw_epochs = msg.get("epochs")
-            if raw_epochs is None:
-                raw_epochs = msg.get("inference_steps", msg.get("inferenceSteps"))
-            epochs_opt, epochs_err = _coerce_epochs(raw_epochs)
+            epochs_fc, epochs_rest, epochs_err = _resolve_fc_rest_epochs(msg)
             if epochs_err:
                 await websocket.send_json({"type": "error", "message": epochs_err})
                 continue
 
-            fc_cfg = cfg_with_epochs(FIRST_CHUNK_CFG, epochs_opt)
+            fc_cfg = cfg_with_epochs(FIRST_CHUNK_CFG, epochs_fc)
 
             logger.info(
-                "WS TTS request  voice=%s  lang=%s  speed=%s  epochs=%s  text=%.80s",
+                "WS TTS request  voice=%s  lang=%s  speed=%s  epochs_fc=%s  epochs_rest=%s  text=%.80s",
                 voice, language or "auto",
                 f"{speed:.2f}" if speed is not None else "default",
-                epochs_opt if epochs_opt is not None else "default",
+                epochs_fc if epochs_fc is not None else "default",
+                epochs_rest if epochs_rest is not None else "default",
                 text,
             )
 
@@ -307,7 +376,7 @@ async def ws_tts(websocket: WebSocket):
             # queue ahead of other streams' first chunks.
             if n > 1:
                 base_1 = LAST_CHUNK_CFG if n == 2 else MID_CHUNK_CFG
-                cfg_1 = cfg_with_epochs(base_1, epochs_opt)
+                cfg_1 = cfg_with_epochs(base_1, epochs_rest)
                 prefetch_task = asyncio.create_task(
                     batcher.submit(
                         all_chunks[1], cfg_1,
@@ -333,7 +402,7 @@ async def ws_tts(websocket: WebSocket):
                         break
                 else:
                     base_i = LAST_CHUNK_CFG if is_last else MID_CHUNK_CFG
-                    cfg_i = cfg_with_epochs(base_i, epochs_opt)
+                    cfg_i = cfg_with_epochs(base_i, epochs_rest)
                     wav_bytes = await batcher.submit(
                         all_chunks[i], cfg_i,
                         language=language, voice=voice, speed=speed,
@@ -348,7 +417,7 @@ async def ws_tts(websocket: WebSocket):
                     base_next = (
                         LAST_CHUNK_CFG if (i + 1 == n - 1) else MID_CHUNK_CFG
                     )
-                    cfg_next = cfg_with_epochs(base_next, epochs_opt)
+                    cfg_next = cfg_with_epochs(base_next, epochs_rest)
                     prefetch_task = asyncio.create_task(
                         batcher.submit(
                             all_chunks[i + 1], cfg_next,
@@ -373,7 +442,7 @@ async def ws_tts(websocket: WebSocket):
 
                 rest_epoch_cfg = cfg_with_epochs(
                     LAST_CHUNK_CFG if is_last else MID_CHUNK_CFG,
-                    epochs_opt,
+                    epochs_rest,
                 )
                 epochs_this = int(rest_epoch_cfg["num_step"])
 
@@ -418,9 +487,11 @@ async def ws_tts(websocket: WebSocket):
 
             epochs_first = int(fc_cfg["num_step"])
             if n <= 1:
-                epochs_rest = epochs_first
+                epochs_rest_done = epochs_first
             else:
-                epochs_rest = int(cfg_with_epochs(MID_CHUNK_CFG, epochs_opt)["num_step"])
+                epochs_rest_done = int(
+                    cfg_with_epochs(MID_CHUNK_CFG, epochs_rest)["num_step"]
+                )
 
             await websocket.send_json({
                 "type":                   "response.audio.done",
@@ -432,7 +503,7 @@ async def ws_tts(websocket: WebSocket):
                 "voice":                  voice,
                 "speed":                  speed,
                 "epochs_first_chunk":     epochs_first,
-                "epochs_rest_chunk":      epochs_rest,
+                "epochs_rest_chunk":      epochs_rest_done,
             })
             logger.info(
                 "Done.  chunks=%d  audio=%dms  wall=%.0fms  first_chunk=%.0fms  "
@@ -440,7 +511,7 @@ async def ws_tts(websocket: WebSocket):
                 n, total_audio_ms, total_wall_ms, first_latency_ms or 0,
                 voice, language or "auto",
                 f"{speed:.2f}" if speed is not None else "default",
-                epochs_first, epochs_rest,
+                epochs_first, epochs_rest_done,
             )
 
     except WebSocketDisconnect:
