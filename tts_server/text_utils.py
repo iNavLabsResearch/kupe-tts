@@ -1,4 +1,10 @@
-"""Text splitting utilities for streaming TTS."""
+"""Text splitting utilities for streaming TTS.
+
+Sentence chunking uses OmniVoice ``chunk_text_punctuation``, which avoids
+splitting on ``.`` / ``,`` when they sit between digits (decimals like ``3.14159``
+and grouping like ``1,50,00,000``). A period followed by a space still ends a
+sentence (e.g. ``It was 3. Then …``).
+"""
 
 from __future__ import annotations
 

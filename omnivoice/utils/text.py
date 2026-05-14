@@ -19,7 +19,10 @@
 
 Provides:
 - ``chunk_text_punctuation()``: Splits long text into model-friendly chunks at
-  sentence boundaries, with abbreviation-aware punctuation splitting.
+  sentence boundaries, with abbreviation-aware punctuation splitting. Periods
+  and commas that sit **between two digits** (no space) are kept inside the same
+  chunk (decimals ``3.14`` and grouped numerals ``1,50,00,000``). A ``.``
+  followed by a space or non-digit still ends a sentence (e.g. ``3.14. Next``).
 - ``add_punctuation()``: Appends missing end punctuation (Chinese or English).
 """
 
@@ -116,6 +119,29 @@ ABBREVIATIONS = {
 }
 
 
+def _digit_adjacent_separator_no_split(
+    token: str,
+    current_sentence: list[str],
+    tokens_list: list[str],
+    pos: int,
+) -> bool:
+    """Treat ``.`` or ``,`` as *inside* a number when digits sit on both sides (no space).
+
+    Covers decimals (``3.5``, ``3.14159``) and grouping commas (``1,50,00,000``).
+    A period followed by a space (``3. Then``) is **not** treated as a decimal
+    and remains a sentence boundary. A dot after digits whose next character is
+    not a digit (``3.14.`` end of sentence) still splits on that final dot.
+    """
+    if token not in (".", ","):
+        return False
+    if len(current_sentence) < 2:
+        return False
+    # current_sentence[-1] is *token* (just appended); [-2] is char before it.
+    prev_ch = current_sentence[-2]
+    next_ch = tokens_list[pos + 1] if pos + 1 < len(tokens_list) else ""
+    return prev_ch.isdigit() and next_ch.isdigit()
+
+
 def chunk_text_punctuation(
     text: str,
     chunk_len: int,
@@ -132,7 +158,7 @@ def chunk_text_punctuation(
 
     tokens_list = list(text)
 
-    for token in tokens_list:
+    for pos, token in enumerate(tokens_list):
         # If the first token of current sentence is punctuation,
         # append it to the end of the previous sentence.
         if (
@@ -148,6 +174,9 @@ def chunk_text_punctuation(
             # Split the sentence in positions of punctuations.
             if token in SPLIT_PUNCTUATION:
                 is_abbreviation = False
+                skip_digit_sep = _digit_adjacent_separator_no_split(
+                    token, current_sentence, tokens_list, pos,
+                )
 
                 if token == ".":
                     temp_str = "".join(current_sentence).strip()
@@ -156,7 +185,7 @@ def chunk_text_punctuation(
                         if last_word in ABBREVIATIONS:
                             is_abbreviation = True
 
-                if not is_abbreviation:
+                if not is_abbreviation and not skip_digit_sep:
                     sentences.append(current_sentence)
                     current_sentence = []
     # Assume the last few tokens are also a sentence

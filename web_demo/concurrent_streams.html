@@ -571,6 +571,44 @@ const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, c => (
 const LS_API_BASE = 'omnivoice_demo_api_base';
 const LS_WS_URL   = 'omnivoice_demo_ws_url';
 
+/** ngrok free / dev tunnels often return an HTML interstitial unless this header is sent. */
+function tunnelBrowserFetchHeaders() {
+  return {
+    'ngrok-skip-browser-warning': 'true',
+    'Accept': 'application/json',
+  };
+}
+
+/** WebSocket API cannot set custom headers; ngrok accepts the same flag as a query param. */
+function withTunnelWsQuery(wsUrl) {
+  try {
+    const u = new URL(wsUrl);
+    const h = u.hostname.toLowerCase();
+    if (
+      h.includes('ngrok-free.app') || h.includes('ngrok.io') ||
+      h.endsWith('loca.lt') || h.includes('localhost.run')
+    ) {
+      u.searchParams.set('ngrok-skip-browser-warning', 'true');
+      return u.toString();
+    }
+  } catch (_) { /* ignore */ }
+  return wsUrl;
+}
+
+/** Reject truncated / broken saved WebSocket URLs (e.g. missing host path). */
+function websocketUrlLooksComplete(raw) {
+  const u = (raw || '').trim();
+  if (!u) return false;
+  try {
+    const p = new URL(u);
+    if (!/^wss?:$/i.test(p.protocol)) return false;
+    const path = p.pathname || '';
+    return path.endsWith('/ws/tts') || path === '/ws/tts';
+  } catch {
+    return false;
+  }
+}
+
 function apiBaseTrim() {
   return ($('apiBase').value || '').trim().replace(/\/$/, '');
 }
@@ -579,7 +617,8 @@ function apiBaseTrim() {
 function originToDefaultWs(origin) {
   let o = (origin || '').trim().replace(/\/$/, '');
   if (!o) o = 'http://localhost:8000';
-  const ws = o.replace(/^http:/i, 'ws:').replace(/^https:/i, 'wss:');
+  // IMPORTANT: replace https before http — otherwise /^http:/ matches the "http" prefix of "https:".
+  const ws = o.replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:');
   return ws + (/\/ws\/tts$/i.test(ws) ? '' : '/ws/tts');
 }
 
@@ -594,21 +633,54 @@ function saveApiPrefs() {
   } catch (_) {}
 }
 
+function mergeVoiceNamesFromPayload(j) {
+  const set = new Set();
+  const addList = (arr) => {
+    if (!Array.isArray(arr)) return;
+    for (const x of arr) {
+      if (x && String(x).trim()) set.add(String(x).trim());
+    }
+  };
+  addList(j.names);
+  addList(j.loaded_names);
+  if (Array.isArray(j.profiles)) {
+    for (const p of j.profiles) {
+      if (p && p.name) set.add(String(p.name).trim());
+    }
+  }
+  return [...set].sort((a, b) => a.localeCompare(b));
+}
+
 async function refreshVoiceList() {
   const base = apiBaseTrim();
   const hint = $('hintLine');
   const sel = $('voiceSelect');
   const prev = sel.value;
   try {
-    const r = await fetch(base + '/api/voices', { cache: 'no-store' });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const url = base + '/api/voices';
+    const r = await fetch(url, {
+      cache: 'no-store',
+      headers: tunnelBrowserFetchHeaders(),
+    });
+    const ct = (r.headers.get('content-type') || '').toLowerCase();
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`HTTP ${r.status}: ${t.slice(0, 180).replace(/\s+/g, ' ')}`);
+    }
+    if (!ct.includes('application/json')) {
+      const t = await r.text();
+      throw new Error(
+        `Expected JSON from /api/voices, got ${ct || 'unknown'} ` +
+        `(tunnel HTML? try ngrok header). Body: ${t.slice(0, 120).replace(/\s+/g, ' ')}…`
+      );
+    }
     const j = await r.json();
-    const names = (j.names && j.names.length) ? j.names : (j.loaded_names || []);
+    const names = mergeVoiceNamesFromPayload(j);
     sel.innerHTML = '';
     if (!names.length) {
       const o = document.createElement('option');
       o.value = 'shanti';
-      o.textContent = 'shanti (no voices reported — check server)';
+      o.textContent = 'shanti (server listed 0 voices — check voice_reference/)';
       sel.appendChild(o);
     } else {
       for (const n of names) {
@@ -622,13 +694,13 @@ async function refreshVoiceList() {
     else if (j.default_voice && [...sel.options].some((op) => op.value === j.default_voice)) {
       sel.value = j.default_voice;
     }
-    hint.textContent = `Voices: ${names.length} from ${base}/api/voices`;
+    hint.textContent = `Voices: ${names.length} · ${url}`;
   } catch (e) {
-    hint.textContent = `Could not fetch voices (${e.message})`;
+    hint.textContent = `Could not fetch voices — ${e.message}`;
     sel.innerHTML = '';
     const o = document.createElement('option');
     o.value = 'shanti';
-    o.textContent = 'shanti (fallback)';
+    o.textContent = 'shanti (fetch failed — see hint line)';
     sel.appendChild(o);
   }
 }
@@ -656,7 +728,11 @@ async function createPersona() {
   fd.append('file', fileIn.files[0], fileIn.files[0].name);
   status.textContent = 'Uploading…';
   try {
-    const r = await fetch(base + '/api/voices', { method: 'POST', body: fd });
+    const r = await fetch(base + '/api/voices', {
+      method: 'POST',
+      headers: { 'ngrok-skip-browser-warning': 'true' },
+      body: fd,
+    });
     const txt = await r.text();
     let j = null;
     try { j = JSON.parse(txt); } catch { /* plain text error */ }
@@ -917,7 +993,8 @@ async function playWavBase64(b64) {
  * Stream runner
  * ==================================================================== */
 function runStream(streamId, params, onComplete) {
-  const ws    = new WebSocket(params.url);
+  const wsUrl = withTunnelWsQuery(params.url);
+  const ws    = new WebSocket(wsUrl);
   const state = {
     tSend: 0, firstAt: 0, chunks: 0, audioMs: 0, ws,
     fclClient: null, fclServer: null,
@@ -1215,7 +1292,7 @@ window.addEventListener('DOMContentLoaded', () => {
   const savedBase = localStorage.getItem(LS_API_BASE);
   const savedWs = localStorage.getItem(LS_WS_URL);
   $('apiBase').value = (savedBase && savedBase.trim()) ? savedBase.trim() : 'http://localhost:8000';
-  if (savedWs && savedWs.trim()) $('url').value = savedWs.trim();
+  if (savedWs && websocketUrlLooksComplete(savedWs)) $('url').value = savedWs.trim();
   else syncWsFromApiBase();
 
   $('apiBase').addEventListener('change', () => {

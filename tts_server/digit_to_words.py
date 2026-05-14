@@ -16,6 +16,11 @@ Optional ``digit_pronunciation`` overrides everything; ``digit_words_hint`` =
 *hinglish* forces English digit words in Indic/SEA scripts when no explicit
 pronunciation was set.
 
+**Grouping commas / spaces:** numerals like ``1,50,00,000`` (Indian lakhs/crores),
+``15,000,000`` (Western thousands), and thin-space / underscore groupings are
+normalised to plain digits before cardinal conversion. Use a **full stop** for
+decimals (e.g. ``1,50,000.5``).
+
 No third-party libraries (pure tables + regex).
 """
 
@@ -588,7 +593,41 @@ _INDIC_HINT_SCRIPTS: frozenset[str] = frozenset({
     "SINHALA", "TIBETAN", "MEETEI MAYEK", "OL CHIKI", "WARANG CITI",
 })
 
-_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_NUMBER_GROUP_SEP = r"[,،٬_\u202f\u00a0\u2009\s]"
+# Indian-style (…,00,000), Western thousands (…,000,000), or plain integers / decimals.
+_NUMBER_RE = re.compile(
+    r"-?(?:"
+    r"\d{1,3}(?:" + _NUMBER_GROUP_SEP + r"\d{2,3})+"
+    r"|\d{1,3}(?:" + _NUMBER_GROUP_SEP + r"\d{3})+"
+    r"|\d+)(?:\.\d+)?",
+    re.UNICODE,
+)
+
+
+def _normalize_numeric_token(raw: str) -> Optional[str]:
+    """Strip lakh/crore/Western-style grouping; return canonical ``-?digits(.digits)?`` or ``None``."""
+    t = raw.replace("\u202f", "").replace("\u00a0", "").replace("\u2009", "")
+    t = re.sub(r"\s+", "", t)
+    t = t.replace("_", "").replace(",", "").replace("،", "").replace("٬", "")
+    if not t or t in ("-", ".", "-."):
+        return None
+    neg = t.startswith("-")
+    if neg:
+        t = t[1:]
+    if "." in t:
+        int_part, frac_part = t.split(".", 1)
+        if frac_part.count("."):
+            return None
+        if int_part == "":
+            int_part = "0"
+        if not int_part.isdigit() or not frac_part.isdigit():
+            return None
+        out = int_part + "." + frac_part
+    else:
+        if not t.isdigit():
+            return None
+        out = t
+    return ("-" + out) if neg else out
 
 # ISO-like keys + English names → canonical pronunciation locale id.
 _PRONUNCIATION_ALIASES: dict[str, str] = {
@@ -740,7 +779,14 @@ class DigitToWordsConverter:
                 conv = _converter_for_locale(loc)
 
         def replace_match(m: re.Match[str]) -> str:
-            return conv(m.group())
+            raw = m.group(0)
+            canon = _normalize_numeric_token(raw)
+            if canon is None:
+                return raw
+            try:
+                return conv(canon)
+            except (ValueError, OverflowError):
+                return raw
 
         return _NUMBER_RE.sub(replace_match, text)
 
