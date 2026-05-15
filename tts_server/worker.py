@@ -217,6 +217,27 @@ def _load_model(model_id: str, load_kw: dict) -> OmniVoice:
         return OmniVoice.from_pretrained(model_id, **load_kw)
 
 
+def _attach_triton_hybrid(runner: Any, model: OmniVoice, *, enable_sage: bool) -> None:
+    """Apply hybrid (Triton kernels + CUDA Graph) optimizations to an already-loaded model."""
+    from omnivoice_triton.models.faster_runner import _CUDAGraphForward
+    from omnivoice_triton.models.patching import (
+        apply_sage_attention,
+        apply_triton_kernels,
+        find_patchable_model,
+    )
+
+    runner._model = model
+    patch_range = getattr(runner, "patch_range", (0, 24))
+    patchable = find_patchable_model(model)
+    apply_triton_kernels(patchable, patch_range=patch_range)
+    if enable_sage:
+        apply_sage_attention(patchable, patch_range=patch_range)
+    graph_forward = _CUDAGraphForward(model)
+    model.forward = graph_forward  # type: ignore[method-assign]
+    runner._graph_forward = graph_forward
+    log.info("Triton hybrid runner attached to loaded OmniVoice model.")
+
+
 # ---------------------------------------------------------------------------
 # Voice prompt building
 # ---------------------------------------------------------------------------
@@ -384,6 +405,9 @@ def worker_init(
     if _model is None:
         _model = _load_model(model_id, load_kw)
 
+    if _model_type == "triton" and _model_triton is not None:
+        _attach_triton_hybrid(_model_triton, _model, enable_sage=use_sage)
+
     _sr = _model.sampling_rate
 
     # ---- Resolve every voice prompt ---------------------------------
@@ -423,7 +447,8 @@ def worker_init(
              len(_prompts), sorted(_prompts.keys()), _default_voice)
 
     # ---- Optional torch.compile --------------------------------------
-    if use_compile and weight_dtype not in ("int4", "int8"):
+    # CUDA Graph (triton hybrid) replaces forward; torch.compile conflicts with it.
+    if use_compile and weight_dtype not in ("int4", "int8") and _model_type != "triton":
         try:
             log.info("Compiling model.forward (mode=%s) …", TORCH_COMPILE_MODE)
             _model.forward = torch.compile(  # type: ignore[assignment]
@@ -434,6 +459,8 @@ def worker_init(
             )
         except Exception as exc:
             log.warning("torch.compile failed: %s — continuing eager.", exc)
+    elif use_compile and _model_type == "triton":
+        log.info("torch.compile skipped (triton hybrid uses CUDA Graph).")
     elif use_compile:
         log.info("torch.compile skipped (incompatible with %s).", weight_dtype)
 
@@ -580,7 +607,7 @@ def worker_generate(
     Returns:
         ``(wav_bytes_list, generation_ms)``
     """
-    global _model, _prompts, _triton_prompts, _default_voice, _sr
+    global _model, _prompts, _default_voice, _sr
 
     if _model is None or not _prompts:
         raise RuntimeError("Worker is not initialised. Call worker_init first.")
@@ -650,43 +677,21 @@ def worker_generate(
         speed_arg = [float(s) if s is not None else None for s in speeds]
 
     t0 = time.perf_counter()
+    infer_model = _model
     if _model_type == "triton" and _model_triton is not None:
-        triton_kwargs: dict[str, Any] = dict(
-            text=texts,
-            language=lang_arg,
-            generation_config=cfg,
-        )
-        if speed_arg is not None:
-            triton_kwargs["speed"] = speed_arg
-        
-        # Triton uses ref_audio (path) and ref_text directly instead of VoiceClonePrompt
-        if voice_names is None:
-            v_list = [_default_voice] * len(texts)
-        else:
-            v_list = [(v or _default_voice) for v in voice_names]
-            
-        ref_audios = [_triton_prompts[v]["ref_audio"] for v in v_list]
-        ref_texts  = [_triton_prompts[v]["ref_text"] for v in v_list]
-        
-        # If batch=1, pass as scalars (some APIs prefer this)
-        if len(texts) == 1:
-            triton_kwargs["ref_audio"] = ref_audios[0]
-            triton_kwargs["ref_text"]  = ref_texts[0]
-        else:
-            triton_kwargs["ref_audio"] = ref_audios
-            triton_kwargs["ref_text"]  = ref_texts
-            
-        audios = _model_triton.generate_voice_clone(**triton_kwargs)
-    else:
-        gen_kwargs: dict[str, Any] = dict(
-            text=texts,
-            language=lang_arg,
-            voice_clone_prompt=prompts,
-            generation_config=cfg,
-        )
-        if speed_arg is not None:
-            gen_kwargs["speed"] = speed_arg
-        audios = _model.generate(**gen_kwargs)
+        triton_model = getattr(_model_triton, "model", None)
+        if triton_model is not None:
+            infer_model = triton_model
+
+    gen_kwargs: dict[str, Any] = dict(
+        text=texts,
+        language=lang_arg,
+        voice_clone_prompt=prompts,
+        generation_config=cfg,
+    )
+    if speed_arg is not None:
+        gen_kwargs["speed"] = speed_arg
+    audios = infer_model.generate(**gen_kwargs)
         
     if torch.cuda.is_available():
         torch.cuda.synchronize()
