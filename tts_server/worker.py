@@ -71,6 +71,7 @@ _model:          Optional[OmniVoice]            = None
 _model_triton:   object                         = None  # omnivoice_triton runner
 _model_type:     str                            = "standard"
 _prompts:        dict[str, VoiceClonePrompt]    = {}    # name → prompt
+_triton_prompts: dict[str, dict]                = {}    # name → {"ref_audio": path, "ref_text": text}
 _default_voice:  str                            = ""    # fallback voice name
 _sr:             int                            = 24_000
 
@@ -341,7 +342,7 @@ def worker_init(
     All voices listed in ``voices_init`` are loaded into worker memory once
     and addressable by name during generation.
     """
-    global _model, _model_triton, _model_type, _prompts, _default_voice, _sr
+    global _model, _model_triton, _model_type, _prompts, _triton_prompts, _default_voice, _sr
 
     _model_type = model_type
 
@@ -390,9 +391,15 @@ def worker_init(
         raise RuntimeError("Worker spawned with no voice profiles.")
 
     _prompts = {}
+    _triton_prompts = {}
     for name, spec in voices_init.items():
         try:
             _prompts[name] = _resolve_voice_prompt(_model, name, spec, model_id)
+            if spec.get("ref_audio_path"):
+                _triton_prompts[name] = {
+                    "ref_audio": spec["ref_audio_path"],
+                    "ref_text":  spec.get("full_ref_text", ""),
+                }
             p = _prompts[name]
             log.info(
                 "[%s] Voice ready  ref_text=%.60s…  tokens=(%d, %d)  rms=%.4f",
@@ -464,7 +471,7 @@ def worker_add_voice(name: str, spec: dict, model_id: str) -> int:
     """
     import os
 
-    global _model, _prompts
+    global _model, _prompts, _triton_prompts
 
     if _model is None:
         raise RuntimeError("worker_add_voice: model not initialised.")
@@ -472,6 +479,11 @@ def worker_add_voice(name: str, spec: dict, model_id: str) -> int:
         raise ValueError("worker_add_voice: empty voice name.")
     name = str(name).strip()
     _prompts[name] = _resolve_voice_prompt(_model, name, spec, model_id)
+    if spec.get("ref_audio_path"):
+        _triton_prompts[name] = {
+            "ref_audio": spec["ref_audio_path"],
+            "ref_text":  spec.get("full_ref_text", ""),
+        }
     p = _prompts[name]
     log.info(
         "[%s] Hot-loaded voice  pid=%d  tokens=(%d, %d)  rms=%.4f",
@@ -568,7 +580,7 @@ def worker_generate(
     Returns:
         ``(wav_bytes_list, generation_ms)``
     """
-    global _model, _prompts, _default_voice, _sr
+    global _model, _prompts, _triton_prompts, _default_voice, _sr
 
     if _model is None or not _prompts:
         raise RuntimeError("Worker is not initialised. Call worker_init first.")
@@ -637,20 +649,45 @@ def worker_generate(
     else:
         speed_arg = [float(s) if s is not None else None for s in speeds]
 
-    gen_kwargs: dict[str, Any] = dict(
-        text=texts,
-        language=lang_arg,
-        voice_clone_prompt=prompts,
-        generation_config=cfg,
-    )
-    if speed_arg is not None:
-        gen_kwargs["speed"] = speed_arg
-
     t0 = time.perf_counter()
     if _model_type == "triton" and _model_triton is not None:
-        audios = _model_triton.generate(**gen_kwargs)
+        triton_kwargs: dict[str, Any] = dict(
+            text=texts,
+            language=lang_arg,
+            generation_config=cfg,
+        )
+        if speed_arg is not None:
+            triton_kwargs["speed"] = speed_arg
+        
+        # Triton uses ref_audio (path) and ref_text directly instead of VoiceClonePrompt
+        if voice_names is None:
+            v_list = [_default_voice] * len(texts)
+        else:
+            v_list = [(v or _default_voice) for v in voice_names]
+            
+        ref_audios = [_triton_prompts[v]["ref_audio"] for v in v_list]
+        ref_texts  = [_triton_prompts[v]["ref_text"] for v in v_list]
+        
+        # If batch=1, pass as scalars (some APIs prefer this)
+        if len(texts) == 1:
+            triton_kwargs["ref_audio"] = ref_audios[0]
+            triton_kwargs["ref_text"]  = ref_texts[0]
+        else:
+            triton_kwargs["ref_audio"] = ref_audios
+            triton_kwargs["ref_text"]  = ref_texts
+            
+        audios = _model_triton.generate_voice_clone(**triton_kwargs)
     else:
+        gen_kwargs: dict[str, Any] = dict(
+            text=texts,
+            language=lang_arg,
+            voice_clone_prompt=prompts,
+            generation_config=cfg,
+        )
+        if speed_arg is not None:
+            gen_kwargs["speed"] = speed_arg
         audios = _model.generate(**gen_kwargs)
+        
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     gen_ms = (time.perf_counter() - t0) * 1000.0
