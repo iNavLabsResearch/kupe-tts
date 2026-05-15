@@ -51,6 +51,7 @@ from .config import (
     MAX_CONCURRENT,
     MAX_WORKERS,
     MODEL_ID,
+    MODEL_TYPE,
     SORT_BATCH,
     USE_CUDNN_BENCH,
     USE_SAGE_ATTN,
@@ -102,6 +103,7 @@ async def lifespan(app: FastAPI):
     device = DEVICE or _auto_device()
     logger.info("╔═══ OmniVoice TTS Server starting ═══╗")
     logger.info("  model               : %s", MODEL_ID)
+    logger.info("  model_type          : %s", MODEL_TYPE)
     logger.info("  device              : %s", device)
     logger.info("  weight_dtype        : %s", WEIGHT_DTYPE)
     logger.info("  default_language    : %s", DEFAULT_LANGUAGE)
@@ -234,6 +236,7 @@ async def lifespan(app: FastAPI):
             voices_init,
             default_voice,
             DEFAULT_LANGUAGE,
+            MODEL_TYPE,
         ),
     )
     logger.info("  ProcessPoolExecutor : %d worker(s) created (workers will spawn now)", MAX_WORKERS)
@@ -298,6 +301,7 @@ async def lifespan(app: FastAPI):
     app.state.batcher         = batcher
     app.state.sample_rate     = tmp_sr
     app.state.device          = device
+    app.state.model_type      = MODEL_TYPE
     app.state.voice_profiles  = profiles            # name -> VoiceProfile
     app.state.default_voice   = default_voice
     # Backwards compat alias used by /health

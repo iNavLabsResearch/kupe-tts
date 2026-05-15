@@ -388,6 +388,12 @@
       <label>Voice
         <select id="voiceSelect"></select>
       </label>
+      <label>Model type
+        <select id="modelType">
+          <option value="triton" selected>triton (fast)</option>
+          <option value="standard">standard (PyTorch)</option>
+        </select>
+      </label>
       <label>First-chunk diffusion steps (empty = server default)
         <input id="epochsFc" type="number" min="1" max="128" step="1" placeholder="default" />
       </label>
@@ -1562,6 +1568,7 @@ function runStream(streamId, params, onComplete) {
       text:  params.text,
       voice: params.voice,
       speed: params.speed,
+      model_type: params.modelType,
     };
     if (params.language && params.language !== 'auto') msg.language = params.language;
     if (params.high_quality) msg.use_high_quality = true;
@@ -1573,7 +1580,7 @@ function runStream(streamId, params, onComplete) {
     ws.send(JSON.stringify(msg));
     setStatus(streamId, 'streaming', 'streaming');
     log(streamId, 'send',
-        `→ tts.request  voice=${params.voice}  lang=${params.language}  ` +
+        `→ tts.request  voice=${params.voice}  model=${params.modelType}  lang=${params.language}  ` +
         `speed=${params.speed}  epochs_fc=${params.epochsFc != null ? params.epochsFc : '∅'}  ` +
         `epochs_rest=${params.epochsRest != null ? params.epochsRest : '∅'}  ` +
         `epochs_legacy=${params.epochs != null ? params.epochs : '∅'}  ` +
@@ -1726,6 +1733,7 @@ async function startRun() {
   const hq          = $('hq').value === '1';
   const digitPronunciation = $('digitPronunciation').value.trim();
   const digitHint        = $('digitHint').value.trim();
+  const modelType        = $('modelType').value;
   playStreamId      = Math.min(concurrent, Math.max(1, parseInt($('playStream').value, 10) || 1));
 
   if (!url || !text) {
@@ -1739,7 +1747,7 @@ async function startRun() {
 
   ensureAudioContext();
   setAudioCard(true, `Playing audio from <strong>Stream ${playStreamId}</strong> · `
-    + `voice=${escapeHtml(voice)}, lang=${escapeHtml(language)}, speed=${speed}.`);
+    + `voice=${escapeHtml(voice)}, model=${escapeHtml(modelType)}, lang=${escapeHtml(language)}, speed=${speed}.`);
 
   $('start').disabled = true;
   $('stop').disabled  = false;
@@ -1772,7 +1780,7 @@ async function startRun() {
   const params  = {
     url, voice, language, speed, text, high_quality: hq,
     epochs: epochsLeg, epochsFc, epochsRest,
-    digitPronunciation, digitHint,
+    digitPronunciation, digitHint, modelType,
   };
   const onComplete = () => {
     doneCount++;
@@ -1889,6 +1897,26 @@ window.addEventListener('DOMContentLoaded', () => {
 
   loadSampleFile();   // overlay with the file content if reachable
   refreshVoiceList();
+
+  // Sync model-type dropdown from the server's /health endpoint.
+  (async function fetchServerModelType() {
+    try {
+      const base = apiBaseTrim();
+      const r = await fetch(base + '/health', {
+        cache: 'no-store',
+        headers: tunnelBrowserFetchHeaders(),
+      });
+      if (r.ok) {
+        const j = await r.json();
+        if (j.model_type) {
+          const sel = $('modelType');
+          if ([...sel.options].some(o => o.value === j.model_type)) {
+            sel.value = j.model_type;
+          }
+        }
+      }
+    } catch (_) { /* server may not be running yet */ }
+  })();
 
   $('start').addEventListener('click', startRun);
   $('stop').addEventListener('click', stopRun);

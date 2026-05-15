@@ -34,6 +34,16 @@ from pathlib import Path
 MODEL_ID:    str        = os.getenv("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")
 DEVICE:      str | None = os.getenv("OMNIVOICE_DEVICE", None)  # None → auto
 
+# Inference backend: "triton" (fast, default) or "standard" (original PyTorch).
+# "triton" requires `pip install omnivoice-triton`.
+_RAW_MODEL_TYPE = os.getenv("OMNIVOICE_MODEL_TYPE", "triton").strip().lower()
+if _RAW_MODEL_TYPE not in ("triton", "standard"):
+    raise ValueError(
+        f"OMNIVOICE_MODEL_TYPE='{_RAW_MODEL_TYPE}' is invalid. "
+        f"Accepted values: 'triton', 'standard'."
+    )
+MODEL_TYPE: str = _RAW_MODEL_TYPE
+
 # Weight dtype / quantization — alias map → canonical code (see docstring).
 _DTYPE_ALIASES: dict[str, str] = {
     # fp32

@@ -35,6 +35,7 @@ from omnivoice.models.omnivoice import (
 
 from .config import (
     MID_CHUNK_CFG,
+    MODEL_TYPE,
     TORCH_COMPILE_MODE,
     USE_CUDNN_BENCH,
     USE_TF32,
@@ -67,6 +68,8 @@ def _clean_language(lang) -> Optional[str]:
 # Per-process globals (set once during worker_init)
 # ---------------------------------------------------------------------------
 _model:          Optional[OmniVoice]            = None
+_model_triton:   object                         = None  # omnivoice_triton runner
+_model_type:     str                            = "standard"
 _prompts:        dict[str, VoiceClonePrompt]    = {}    # name → prompt
 _default_voice:  str                            = ""    # fallback voice name
 _sr:             int                            = 24_000
@@ -331,13 +334,16 @@ def worker_init(
     voices_init:        dict[str, dict],   # name → init spec (see _resolve_voice_prompt)
     default_voice:      str,
     default_language:   str,
+    model_type:         str = "triton",
 ) -> None:
     """One-time per-process initialisation.
 
     All voices listed in ``voices_init`` are loaded into worker memory once
     and addressable by name during generation.
     """
-    global _model, _prompts, _default_voice, _sr
+    global _model, _model_triton, _model_type, _prompts, _default_voice, _sr
+
+    _model_type = model_type
 
     logging.basicConfig(
         format="%(asctime)s %(levelname)s [Worker-%(process)d] %(message)s",
@@ -351,11 +357,32 @@ def worker_init(
     patch_sage_attention(use_sage)
 
     load_kw = _build_load_kwargs(device, weight_dtype, attn_impl)
-    log.info(
-        "Loading OmniVoice  model=%s  device=%s  weight_dtype=%s  attn=%s  sage=%s",
-        model_id, device, weight_dtype, attn_impl, use_sage,
-    )
-    _model = _load_model(model_id, load_kw)
+
+    if _model_type == "triton":
+        log.info(
+            "Loading OmniVoice (triton)  model=%s  device=%s  weight_dtype=%s  sage=%s",
+            model_id, device, weight_dtype, use_sage,
+        )
+        try:
+            from omnivoice_triton import create_runner as _create_triton_runner
+            _model_triton = _create_triton_runner("hybrid")
+        except ImportError:
+            log.warning(
+                "omnivoice-triton not installed — falling back to standard OmniVoice."
+            )
+            _model_type = "standard"
+
+    if _model_type == "standard" or _model is None:
+        log.info(
+            "Loading OmniVoice (standard)  model=%s  device=%s  weight_dtype=%s  attn=%s  sage=%s",
+            model_id, device, weight_dtype, attn_impl, use_sage,
+        )
+        _model = _load_model(model_id, load_kw)
+
+    # Always load the standard model for voice prompt creation / tokenizer access
+    if _model is None:
+        _model = _load_model(model_id, load_kw)
+
     _sr = _model.sampling_rate
 
     # ---- Resolve every voice prompt ---------------------------------
@@ -509,6 +536,7 @@ def worker_probe() -> dict:
         "voices":        sorted(_prompts.keys()),
         "default_voice": _default_voice,
         "sample_rate":   int(_sr),
+        "model_type":    _model_type,
     }
 
 
@@ -619,7 +647,10 @@ def worker_generate(
         gen_kwargs["speed"] = speed_arg
 
     t0 = time.perf_counter()
-    audios = _model.generate(**gen_kwargs)
+    if _model_type == "triton" and _model_triton is not None:
+        audios = _model_triton.generate(**gen_kwargs)
+    else:
+        audios = _model.generate(**gen_kwargs)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     gen_ms = (time.perf_counter() - t0) * 1000.0

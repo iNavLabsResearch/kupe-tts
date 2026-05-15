@@ -253,6 +253,10 @@ async def ws_tts(websocket: WebSocket):
                 })
                 continue
 
+            # Model type: client can send it but it's informational —
+            # the worker uses whatever was loaded at startup.
+            model_type: str = getattr(websocket.app.state, "model_type", "triton")
+
             speed, speed_err = _coerce_speed(msg.get("speed"))
             if speed_err:
                 await websocket.send_json({"type": "error", "message": speed_err})
@@ -278,9 +282,10 @@ async def ws_tts(websocket: WebSocket):
             fc_cfg = cfg_with_epochs(FIRST_CHUNK_CFG, epochs_fc)
 
             logger.info(
-                "WS TTS request  voice=%s  lang=%s  speed=%s  epochs_fc=%s  epochs_rest=%s  text=%.80s",
+                "WS TTS request  voice=%s  lang=%s  speed=%s  model=%s  epochs_fc=%s  epochs_rest=%s  text=%.80s",
                 voice, language or "auto",
                 f"{speed:.2f}" if speed is not None else "default",
+                model_type,
                 epochs_fc if epochs_fc is not None else "default",
                 epochs_rest if epochs_rest is not None else "default",
                 text,
@@ -366,6 +371,7 @@ async def ws_tts(websocket: WebSocket):
                 "language":               language or "auto",
                 "voice":                  voice,
                 "speed":                  speed,
+                "model_type":             model_type,
                 "first_chunk_latency_ms": round(first_latency_ms, 1),
                 "epochs":                 int(fc_cfg["num_step"]),
             })
@@ -472,6 +478,7 @@ async def ws_tts(websocket: WebSocket):
                     "language":             language or "auto",
                     "voice":                voice,
                     "speed":                speed,
+                    "model_type":           model_type,
                     "epochs":               epochs_this,
                 })
 
@@ -502,6 +509,7 @@ async def ws_tts(websocket: WebSocket):
                 "language":               language or "auto",
                 "voice":                  voice,
                 "speed":                  speed,
+                "model_type":             model_type,
                 "epochs_first_chunk":     epochs_first,
                 "epochs_rest_chunk":      epochs_rest_done,
             })
