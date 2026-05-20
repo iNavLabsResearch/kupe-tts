@@ -134,12 +134,17 @@ You > Hello, how are you doing today? I hope everything is going well.
   "encoding": "wav/pcm16",
   "sample_rate": 24000,
   "chunk_index": 0,
+  "total_chunks": 2,
   "chunk_text": "Your text here.",
   "chunk_audio_ms": 1200,
   "chunk_gen_ms": 141.3,
   "first_chunk_latency_ms": 143.0   // only on chunk_index == 0
 }
 ```
+
+Keep the WebSocket open and read messages until you receive **`response.audio.done`**
+(do not close after the first `response.audio.delta`). Each delta includes
+`total_chunks` so you know how many audio messages to expect.
 
 **Done signal** (sent after all chunks):
 ```json

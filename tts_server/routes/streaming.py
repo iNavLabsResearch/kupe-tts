@@ -252,6 +252,7 @@ async def ws_tts(websocket: WebSocket):
                 await websocket.send_bytes(header + pcm_bytes)
                 await websocket.send_json({
                     "type":                   "response.audio.meta",
+                    "total_chunks":           n,
                     "chunk_index":            0,
                     "chunk_text":             first_text,
                     "chunk_audio_ms":         round(chunk_audio_ms, 1),
@@ -272,6 +273,7 @@ async def ws_tts(websocket: WebSocket):
                 # First chunk includes full static metadata; subsequent chunks omit it (3.4)
                 await websocket.send_json({
                     "type":                   "response.audio.delta",
+                    "total_chunks":           n,
                     "delta":                  b64_encode(wav_out),
                     "encoding":               "wav/pcm16",
                     "sample_rate":            sample_rate,
@@ -292,6 +294,7 @@ async def ws_tts(websocket: WebSocket):
                     "first_chunk_latency_ms": round(first_latency_ms, 1),
                     "epochs":                 int(fc_cfg["num_step"]),
                 })
+            logger.info("WS sent chunk 0/%d", n)
 
             # NOW that the first chunk is sent, pre-submit chunk 1.
             # This is intentionally deferred: submitting before the
@@ -383,6 +386,7 @@ async def ws_tts(websocket: WebSocket):
                     await websocket.send_bytes(header + pcm_bytes)
                     await websocket.send_json({
                         "type":                 "response.audio.meta",
+                        "total_chunks":         n,
                         "chunk_index":          i,
                         "chunk_text":           all_chunks[i],
                         "chunk_audio_ms":       round(chunk_audio_ms, 1),
@@ -398,6 +402,7 @@ async def ws_tts(websocket: WebSocket):
                     # Slim payload — omit static metadata already sent in chunk 0 (3.4)
                     await websocket.send_json({
                         "type":                 "response.audio.delta",
+                        "total_chunks":         n,
                         "delta":                b64_encode(wav_out),
                         "encoding":             "wav/pcm16",
                         "sample_rate":          sample_rate,
@@ -413,6 +418,7 @@ async def ws_tts(websocket: WebSocket):
                         "cumulative_audio_sec": round(cumulative_audio_ms / 1000.0, 3),
                         "epochs":               epochs_this,
                     })
+                logger.info("WS sent chunk %d/%d", i, n)
 
             tail = xfader.flush()
             if tail is not None:

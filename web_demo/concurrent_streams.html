@@ -1569,10 +1569,14 @@ function runStream(streamId, params, onComplete) {
   };
 
   ws.onmessage = (ev) => {
+    // Binary PCM frames (binary_audio=true) are not JSON — ignore here; meta follows each frame.
+    if (typeof ev.data !== 'string') return;
+
     let m;
     try { m = JSON.parse(ev.data); } catch { return; }
 
-    if (m.type === 'response.audio.delta') {
+    const isAudioChunk = (m.type === 'response.audio.delta' || m.type === 'response.audio.meta');
+    if (isAudioChunk) {
       state.chunks++;
       state.audioMs += (m.chunk_audio_ms || 0);
 
@@ -1603,17 +1607,25 @@ function runStream(streamId, params, onComplete) {
         `chunk[${m.chunk_index}]  ${wallPart}${sincePart}${ep}  ` +
         `audio=${audSec}s  text="${preview}${(m.chunk_text||'').length > 50 ? '…' : ''}"`);
 
-      let wavAb;
-      try {
-        wavAb = wavBase64ToArrayBuffer(m.delta);
-      } catch (e) {
-        log(streamId, 'err', `audio base64 decode failed: ${e.message}`);
-        return;
+      if (m.delta) {
+        let wavAb;
+        try {
+          wavAb = wavBase64ToArrayBuffer(m.delta);
+        } catch (e) {
+          log(streamId, 'err', `audio base64 decode failed: ${e.message}`);
+          return;
+        }
+        if (!streamAudioChunks[streamId]) streamAudioChunks[streamId] = [];
+        streamAudioChunks[streamId].push(wavAb);
+        refreshAudioCacheStatus();
+        if (streamId === playStreamId) playWavArrayBuffer(wavAb);
       }
-      if (!streamAudioChunks[streamId]) streamAudioChunks[streamId] = [];
-      streamAudioChunks[streamId].push(wavAb);
-      refreshAudioCacheStatus();
-      if (streamId === playStreamId) playWavArrayBuffer(wavAb);
+
+      const total = m.total_chunks;
+      if (total != null && state.chunks < total) {
+        setStatus(streamId, 'streaming', `chunk ${state.chunks}/${total}`);
+      }
+      return;
     }
     else if (m.type === 'response.audio.done') {
       const wall = performance.now() - state.tSend;
@@ -1634,13 +1646,13 @@ function runStream(streamId, params, onComplete) {
         `done  chunks=${m.total_chunks}  audio=${m.total_audio_ms}ms  ` +
         `server_wall=${(m.total_gen_ms ?? 0).toFixed(0)}ms  ` +
         `client_wall=${wall.toFixed(0)}ms  rtf=${rtf}${epochPart}`);
-      try { ws.close(); } catch {}
+      // Keep the WebSocket open until the user stops the run or starts a new one.
+      // The server stays in its receive loop for more tts.request messages.
       onComplete(streamId, true);
     }
     else if (m.type === 'error') {
       setStatus(streamId, 'error', 'error');
       log(streamId, 'err', `server error: ${m.message}`);
-      try { ws.close(); } catch {}
       onComplete(streamId, false);
     }
   };
