@@ -114,7 +114,7 @@ async def ws_tts(websocket: WebSocket):
                 })
                 continue
 
-            text = _coerce_text(msg.get("text"))
+            text = coerce_text(msg.get("text"))
             if not text:
                 await websocket.send_json({"type": "error", "message": "Empty text."})
                 continue
@@ -143,20 +143,20 @@ async def ws_tts(websocket: WebSocket):
             # the worker uses whatever was loaded at startup.
             model_type: str = getattr(websocket.app.state, "model_type", "triton")
 
-            speed, speed_err = _coerce_speed(msg.get("speed"))
+            speed, speed_err = coerce_speed(msg.get("speed"))
             if speed_err:
                 await websocket.send_json({"type": "error", "message": speed_err})
                 continue
             if speed is None:
                 speed = DEFAULT_SPEED
 
-            digit_words_lang = _coerce_opt_str(
+            digit_words_lang = coerce_opt_str(
                 msg.get("digit_words_lang") or msg.get("digitWordsLang")
             )
-            digit_words_hint = _coerce_opt_str(
+            digit_words_hint = coerce_opt_str(
                 msg.get("digit_words_hint") or msg.get("digitWordsHint")
             )
-            digit_pronunciation = _coerce_opt_str(
+            digit_pronunciation = coerce_opt_str(
                 msg.get("digit_pronunciation") or msg.get("digitPronunciation")
             )
 
