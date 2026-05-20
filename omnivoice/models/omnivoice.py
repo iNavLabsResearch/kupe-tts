@@ -524,8 +524,6 @@ class OmniVoice(PreTrainedModel):
                     self.llm,
                     suffix_embeds,
                     past,
-                    suffix_len=t_len,
-                    prefix_len=prefix_len,
                 )
             except Exception as exc:
                 logger.warning(
