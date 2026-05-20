@@ -10,11 +10,11 @@ The value is normalised to one of these canonical codes:
 
   ``fp32``   : full-precision (largest, slowest, most accurate)
                 aliases: ``float32``, ``f32``, ``32``
-  ``fp16``   : default for CUDA — half-precision floating point
+  ``fp16``   : half-precision floating point (CUDA)
                 aliases: ``float16``, ``f16``, ``half``, ``16``
   ``bf16``   : bfloat16 — same memory as fp16 with wider dynamic range
                 aliases: ``bfloat16``, ``bf16``, ``brain16``
-  ``int8``   : 8-bit weights via ``bitsandbytes`` (lower VRAM, slight quality loss)
+  ``int8``   : default — 8-bit weights via ``bitsandbytes`` (lower VRAM, slight quality loss)
                 aliases: ``i8``, ``8bit``, ``8``
   ``int4``   : 4-bit NF4 weights via ``bitsandbytes`` (lowest VRAM, larger quality loss)
                 aliases: ``i4``, ``4bit``, ``4``, ``nf4``
@@ -71,7 +71,7 @@ _DTYPE_ALIASES: dict[str, str] = {
     # int4
     "int4": "int4", "i4": "int4", "4bit": "int4", "4": "int4", "nf4": "int4",
 }
-_RAW_WEIGHT_DTYPE = os.getenv("OMNIVOICE_WEIGHT_DTYPE", "fp16").strip().lower()
+_RAW_WEIGHT_DTYPE = os.getenv("OMNIVOICE_WEIGHT_DTYPE", "int8").strip().lower()
 if _RAW_WEIGHT_DTYPE not in _DTYPE_ALIASES:
     raise ValueError(
         f"OMNIVOICE_WEIGHT_DTYPE='{_RAW_WEIGHT_DTYPE}' is invalid. "

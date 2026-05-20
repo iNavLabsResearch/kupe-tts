@@ -45,7 +45,7 @@ Client  →  WebSocket  →  FastAPI Server
 # Install the OmniVoice package (from project root)
 pip install -e .
 
-# Install server-specific extras
+# Install server-specific extras (includes bitsandbytes for default int8 weights)
 pip install -r requirements_server.txt
 ```
 
@@ -85,6 +85,7 @@ The server will:
 | `OMNIVOICE_FORWARDED_ALLOW_IPS` | `127.0.0.1,::1` | Trusted proxy IPs for forwarded headers |
 | `OMNIVOICE_MODEL` | `k2-fsa/OmniVoice` | HuggingFace model ID or local path |
 | `OMNIVOICE_DEVICE` | auto | `cuda`, `mps`, or `cpu` |
+| `OMNIVOICE_WEIGHT_DTYPE` | `int8` | `int8`, `int4`, `fp16`, `bf16`, or `fp32` (needs `bitsandbytes` for int8/int4) |
 | `CHUNK_CHARS` | `60` | Sentence chunk size in characters |
 
 ### 3. Run the test client

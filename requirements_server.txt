@@ -4,5 +4,6 @@
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
 websockets>=12.0
+bitsandbytes>=0.43.0      # OMNIVOICE_WEIGHT_DTYPE=int8|int4 (default int8)
 sounddevice>=0.4.6        # optional: live audio playback in test client
 python-multipart>=0.0.9   # fastapi file uploads (optional)
