@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import io
+import shutil
+import subprocess
 from typing import Optional
 
 import numpy as np
@@ -31,6 +33,71 @@ def np_to_wav_bytes(audio: np.ndarray, sr: int) -> bytes:
 
 def b64_encode(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
+
+
+def wav_to_pcm16_bytes(wav_bytes: bytes) -> bytes:
+    """Extract raw PCM16 LE mono samples (OpenAI ``response_format=pcm``)."""
+    audio, _ = wav_bytes_to_np(wav_bytes)
+    pcm = (audio * 32767.0).clip(-32768, 32767).astype(np.int16)
+    return pcm.tobytes()
+
+
+def _transcode_with_ffmpeg(wav_bytes: bytes, fmt: str) -> bytes:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError(
+            f"response_format={fmt!r} requires ffmpeg on PATH; "
+            "install ffmpeg or use response_format='wav' or 'pcm'."
+        )
+    codec_map = {
+        "mp3": ("libmp3lame", "audio/mpeg"),
+        "opus": ("libopus", "audio/opus"),
+        "aac": ("aac", "audio/aac"),
+        "flac": ("flac", "audio/flac"),
+    }
+    codec, _ = codec_map[fmt]
+    proc = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "wav",
+            "-i",
+            "pipe:0",
+            "-f",
+            fmt if fmt != "aac" else "adts",
+            "-acodec",
+            codec,
+            "pipe:1",
+        ],
+        input=wav_bytes,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg transcode to {fmt} failed: {err or proc.returncode}")
+    return proc.stdout
+
+
+def encode_speech_response(wav_bytes: bytes, response_format: str) -> tuple[bytes, str]:
+    """Convert worker WAV bytes to the requested OpenAI ``response_format``."""
+    fmt = response_format.lower()
+    if fmt == "wav":
+        return wav_bytes, "audio/wav"
+    if fmt == "pcm":
+        return wav_to_pcm16_bytes(wav_bytes), "audio/pcm"
+    if fmt in {"mp3", "opus", "aac", "flac"}:
+        media_types = {
+            "mp3": "audio/mpeg",
+            "opus": "audio/opus",
+            "aac": "audio/aac",
+            "flac": "audio/flac",
+        }
+        return _transcode_with_ffmpeg(wav_bytes, fmt), media_types[fmt]
+    raise ValueError(f"Unsupported response_format: {response_format!r}")
 
 
 # ---------------------------------------------------------------------------

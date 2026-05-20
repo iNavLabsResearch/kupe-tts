@@ -304,7 +304,7 @@ async def lifespan(app: FastAPI):
     batcher.start()
     logger.info("  DynamicBatcher      : started")
     logger.info("╚══════════════════════════════════════╝")
-    logger.info("Endpoints: WS /ws/tts  |  POST /api/tts/batch  |  GET /api/voices  |  GET /health")
+    logger.info("Endpoints: WS /ws/tts  |  POST /api/tts/batch  |  POST /v1/audio/speech  |  GET /v1/models  |  GET /api/voices  |  GET /health")
     logger.info("Server is READY — Uvicorn will now bind the listening port.")
 
     app.state.executor        = executor

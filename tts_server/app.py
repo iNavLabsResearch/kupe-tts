@@ -17,7 +17,7 @@ from .config import (
     TRUST_PROXY_HEADERS,
     FORWARDED_ALLOW_IPS,
 )
-from .routes import batch_router, health_router, streaming_router, voices_router
+from .routes import batch_router, health_router, openai_speech_router, streaming_router, voices_router
 from .services.synthesis import DefaultSynthesisService
 from .services.voice import DefaultVoiceService
 from .startup import lifespan
@@ -69,6 +69,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(health_router)
     app.include_router(batch_router)
+    app.include_router(openai_speech_router)
     app.include_router(streaming_router)
     app.include_router(voices_router)
     return app
