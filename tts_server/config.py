@@ -237,6 +237,10 @@ EARLY_EXIT_THRESHOLD: float = max(0.0, float(
     os.getenv("OMNIVOICE_EARLY_EXIT", "0.0")
 ))
 
+# Prefix KV cache for iterative diffusion (conditional branch only).
+# Reuses attention K/V for style + text + reference audio across steps.
+USE_KV_CACHE: bool = os.getenv("OMNIVOICE_KV_CACHE", "1") == "1"
+
 # ---------------------------------------------------------------------------
 # Generation config dicts (plain dicts for safe pickling across processes)
 # ---------------------------------------------------------------------------
@@ -250,6 +254,7 @@ FIRST_CHUNK_CFG: dict = dict(
     position_temperature=5.0,
     class_temperature=0.0,
     early_exit_threshold=EARLY_EXIT_THRESHOLD,
+    use_kv_cache=USE_KV_CACHE,
 )
 
 MID_CHUNK_CFG: dict = dict(
@@ -262,6 +267,7 @@ MID_CHUNK_CFG: dict = dict(
     position_temperature=5.0,
     class_temperature=0.0,
     early_exit_threshold=EARLY_EXIT_THRESHOLD,
+    use_kv_cache=USE_KV_CACHE,
 )
 
 LAST_CHUNK_CFG: dict = dict(
@@ -274,6 +280,7 @@ LAST_CHUNK_CFG: dict = dict(
     position_temperature=5.0,
     class_temperature=0.0,
     early_exit_threshold=EARLY_EXIT_THRESHOLD,
+    use_kv_cache=USE_KV_CACHE,
 )
 
 # ---------------------------------------------------------------------------

@@ -66,6 +66,11 @@ from omnivoice.utils.audio import (
     remove_silence,
     trim_long_audio,
 )
+from omnivoice.models.kv_cache import (
+    llm_forward_prefix_cache,
+    llm_forward_suffix_with_past,
+    llm_supports_kv_cache,
+)
 from omnivoice.utils.duration import RuleDurationEstimator
 from omnivoice.utils.lang_map import LANG_IDS, LANG_NAMES
 from omnivoice.utils.text import add_punctuation, chunk_text_punctuation
@@ -112,6 +117,9 @@ class OmniVoiceGenerationConfig:
     # 0.0 = disabled (always run all num_step steps).
     # 0.02 = exit when ≤2% tokens remain masked (saves ~1-3 steps typically).
     early_exit_threshold: float = 0.0
+    # Cache prefix K/V for the conditional branch during iterative diffusion.
+    # Skips re-computing attention keys for style + text + reference audio.
+    use_kv_cache: bool = True
 
     @classmethod
     def from_dict(cls, kwargs_dict):
@@ -384,6 +392,171 @@ class OmniVoice(PreTrainedModel):
 
         return torch.where(audio_mask.unsqueeze(-1), audio_embeds, text_embeds)
 
+    def _logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Map LLM hidden states → audio logits ``(B, C, S, V)``."""
+        batch_size, seq_len, _ = hidden_states.shape
+        logits_flat = self.audio_heads(hidden_states)
+        return logits_flat.view(
+            batch_size,
+            seq_len,
+            self.config.num_audio_codebook,
+            self.config.audio_vocab_size,
+        ).permute(0, 2, 1, 3)
+
+    def _llm_forward_full(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        """Run the backbone LLM and return hidden states ``(B, S, H)``."""
+        llm_outputs = self.llm(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            return_dict=True,
+            position_ids=position_ids,
+        )
+        return llm_outputs[0]
+
+    def _forward_logits_from_embeds(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        hidden = self._llm_forward_full(inputs_embeds, attention_mask=attention_mask)
+        return self._logits_from_hidden(hidden).to(torch.float32)
+
+    def _build_cond_prefix_kv_caches(
+        self,
+        batch_input_ids: torch.Tensor,
+        batch_audio_mask: torch.Tensor,
+        c_lens: list[int],
+        target_lens: list[int],
+        batch_size: int,
+    ) -> Optional[list[Any]]:
+        """Pre-compute prefix ``past_key_values`` for each conditional row."""
+        if not llm_supports_kv_cache(self.llm):
+            logger.debug("KV cache: backbone does not support past_key_values.")
+            return None
+
+        cond_ids = batch_input_ids[:batch_size]
+        cond_mask = batch_audio_mask[:batch_size]
+        embeds = self._prepare_embed_inputs(cond_ids, cond_mask)
+        pasts: list[Any] = []
+        for i in range(batch_size):
+            t_len = target_lens[i]
+            c_len = c_lens[i]
+            prefix_len = c_len - t_len
+            if prefix_len <= 0:
+                pasts.append(None)
+                continue
+            prefix_embeds = embeds[i : i + 1, :prefix_len, :]
+            try:
+                pasts.append(
+                    llm_forward_prefix_cache(self.llm, prefix_embeds)
+                )
+            except Exception as exc:
+                logger.warning(
+                    "KV cache: prefix pass failed for row %d (%s) — disabling cache.",
+                    i, exc,
+                )
+                return None
+        logger.debug(
+            "KV cache: built prefix past for %d/%d conditional rows.",
+            sum(p is not None for p in pasts), batch_size,
+        )
+        return pasts
+
+    def _diffusion_forward_logits(
+        self,
+        batch_input_ids: torch.Tensor,
+        batch_audio_mask: torch.Tensor,
+        batch_attention_mask: torch.Tensor,
+        batch_size: int,
+        c_lens: list[int],
+        target_lens: list[int],
+        gen_config: OmniVoiceGenerationConfig,
+        cond_prefix_pasts: Optional[list[Any]],
+    ) -> torch.Tensor:
+        """One diffusion step → logits ``(2B, C, S, V)`` (float32)."""
+        total_rows = batch_input_ids.size(0)
+        seq_len = batch_input_ids.size(2)
+        embeds = self._prepare_embed_inputs(batch_input_ids, batch_audio_mask)
+
+        use_cache = (
+            gen_config.use_kv_cache
+            and cond_prefix_pasts is not None
+            and llm_supports_kv_cache(self.llm)
+        )
+
+        if not use_cache:
+            return self._forward_logits_from_embeds(
+                embeds, attention_mask=batch_attention_mask,
+            )
+
+        logits = torch.empty(
+            total_rows,
+            self.config.num_audio_codebook,
+            seq_len,
+            self.config.audio_vocab_size,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        # Conditional rows: suffix forward with cached prefix K/V
+        for i in range(batch_size):
+            t_len = target_lens[i]
+            c_len = c_lens[i]
+            prefix_len = c_len - t_len
+            past = cond_prefix_pasts[i] if cond_prefix_pasts else None
+            if past is None or prefix_len <= 0 or t_len <= 0:
+                hidden = self._llm_forward_full(
+                    embeds[i : i + 1],
+                    attention_mask=batch_attention_mask[i : i + 1],
+                )
+                logits[i : i + 1, :, :c_len, :] = self._logits_from_hidden(hidden)[
+                    :, :, :c_len, :
+                ]
+                continue
+            suffix_embeds = embeds[i : i + 1, prefix_len:c_len, :]
+            try:
+                hidden = llm_forward_suffix_with_past(
+                    self.llm,
+                    suffix_embeds,
+                    past,
+                    suffix_len=t_len,
+                    prefix_len=prefix_len,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "KV cache: suffix pass failed row %d (%s) — full forward fallback.",
+                    i, exc,
+                )
+                hidden = self._llm_forward_full(
+                    embeds[i : i + 1],
+                    attention_mask=batch_attention_mask[i : i + 1],
+                )
+                logits[i : i + 1] = self._logits_from_hidden(hidden)
+                continue
+            suffix_logits = self._logits_from_hidden(hidden)
+            logits[i : i + 1, :, prefix_len:c_len, :] = suffix_logits
+
+        # Unconditional rows: no fixed prefix — full forward each step
+        for i in range(batch_size):
+            u_row = batch_size + i
+            u_len = target_lens[i]
+            if u_len <= 0:
+                continue
+            hidden = self._llm_forward_full(
+                embeds[u_row : u_row + 1, :u_len, :],
+                attention_mask=batch_attention_mask[u_row : u_row + 1, :, :u_len, :u_len],
+            )
+            logits[u_row : u_row + 1, :, :u_len, :] = self._logits_from_hidden(hidden)[
+                :, :, :u_len, :
+            ]
+
+        return logits
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -425,16 +598,7 @@ class OmniVoice(PreTrainedModel):
 
         loss = None
 
-        # Shape: [B, S, C * Vocab]
-        batch_size, seq_len, _ = hidden_states.shape
-        logits_flat = self.audio_heads(hidden_states)
-        # Shape: [B, S, C, Vocab] -> [B, C, S, Vocab]
-        audio_logits = logits_flat.view(
-            batch_size,
-            seq_len,
-            self.config.num_audio_codebook,
-            self.config.audio_vocab_size,
-        ).permute(0, 2, 1, 3)
+        audio_logits = self._logits_from_hidden(hidden_states)
 
         if labels is not None:
 
@@ -1256,6 +1420,16 @@ class OmniVoice(PreTrainedModel):
             self.config.num_audio_codebook, device=self.device
         ).view(1, -1, 1)
 
+        cond_prefix_pasts: Optional[list[Any]] = None
+        if gen_config.use_kv_cache:
+            cond_prefix_pasts = self._build_cond_prefix_kv_caches(
+                batch_input_ids,
+                batch_audio_mask,
+                c_lens,
+                task.target_lens,
+                B,
+            )
+
         for step in range(gen_config.num_step):
             # ---- Adaptive early exit (opt 2.1) ----
             # If all batch items have unmasked enough tokens, skip remaining
@@ -1278,11 +1452,16 @@ class OmniVoice(PreTrainedModel):
                     )
                     break
 
-            batch_logits = self(
-                input_ids=batch_input_ids,
-                audio_mask=batch_audio_mask,
-                attention_mask=batch_attention_mask,
-            ).logits.to(torch.float32)
+            batch_logits = self._diffusion_forward_logits(
+                batch_input_ids,
+                batch_audio_mask,
+                batch_attention_mask,
+                B,
+                c_lens,
+                task.target_lens,
+                gen_config,
+                cond_prefix_pasts,
+            )
 
             for i in range(B):
                 k = schedules[i][step]

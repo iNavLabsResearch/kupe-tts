@@ -40,6 +40,7 @@ from .config import (
     SORT_BATCH,
     TRUST_PROXY_HEADERS,
     USE_CUDNN_BENCH,
+    USE_KV_CACHE,
     USE_SAGE_ATTN,
     USE_TF32,
     USE_TORCH_COMPILE,
@@ -114,6 +115,7 @@ async def lifespan(app: FastAPI):
     logger.info("  crossfade_ms        : %d", CROSSFADE_MS)
     logger.info("  first_chunk_steps   : %d", FIRST_CHUNK_STEPS)
     logger.info("  first_chunk_guidance: %.1f", FIRST_CHUNK_GUIDANCE)
+    logger.info("  kv_cache            : %s", USE_KV_CACHE)
 
     if VOICE_PROFILES_AUTO:
         discovered = list_profiles()
