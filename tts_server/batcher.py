@@ -329,6 +329,9 @@ class DynamicBatcher:
             use_raw,
         )
 
+        # Offload to the GPU thread pool (thread executor) or worker process
+        # (process executor).  Triton CUDA Graph capture is TLS-bound — init must
+        # run on this same pool thread (see startup.py).
         loop = asyncio.get_running_loop()
         gen_func = self._runtime.generate_raw if use_raw else self._runtime.generate
         try:

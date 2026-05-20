@@ -198,11 +198,24 @@ async def lifespan(app: FastAPI):
     )
 
     if EXECUTOR_TYPE == "thread":
+        # CUDA Graph / inductor cudagraph_trees capture is thread-local.  Init and
+        # warm-up must run on the same thread as batcher inference (run_in_executor).
+        gpu_threads = 1 if MODEL_TYPE == "triton" else MAX_WORKERS
+        if gpu_threads != MAX_WORKERS:
+            logger.warning(
+                "  Thread executor capped to 1 worker for triton CUDA Graph "
+                "(OMNIVOICE_MAX_WORKERS=%d ignored).",
+                MAX_WORKERS,
+            )
         logger.info(
-            "  Loading model in-process (thread executor) …"
+            "  Loading model in-process (thread executor, %d GPU thread) …",
+            gpu_threads,
         )
-        t_warm = time.perf_counter()
-        worker_init(
+        executor = ThreadPoolExecutor(
+            max_workers=gpu_threads,
+            thread_name_prefix="omnivoice-gpu",
+        )
+        init_args = (
             MODEL_ID,
             device,
             ATTN_IMPL,
@@ -214,10 +227,13 @@ async def lifespan(app: FastAPI):
             DEFAULT_LANGUAGE,
             MODEL_TYPE,
         )
+        t_warm = time.perf_counter()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(executor, worker_init, *init_args)
         warm_ms = (time.perf_counter() - t_warm) * 1000.0
-        logger.info("  Model + warm-up     : DONE in %.0f ms (in-process)", warm_ms)
+        logger.info("  Model + warm-up     : DONE in %.0f ms (GPU thread)", warm_ms)
 
-        probe_result = worker_probe()
+        probe_result = await loop.run_in_executor(executor, worker_probe)
         if not probe_result.get("ready"):
             raise RuntimeError(
                 "In-process worker reported NOT ready — aborting startup."
@@ -228,11 +244,6 @@ async def lifespan(app: FastAPI):
             probe_result.get("voices"), probe_result.get("sample_rate", 0),
         )
         tmp_sr = int(probe_result.get("sample_rate", tmp_sr))
-
-        executor = ThreadPoolExecutor(
-            max_workers=MAX_WORKERS,
-            thread_name_prefix="omnivoice-gpu",
-        )
     else:
         executor = ProcessPoolExecutor(
             max_workers=MAX_WORKERS,
