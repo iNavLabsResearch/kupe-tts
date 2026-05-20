@@ -29,7 +29,7 @@ import asyncio
 import logging
 import multiprocessing as mp
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -47,6 +47,7 @@ from .config import (
     DEFAULT_LANGUAGE,
     DEFAULT_VOICE,
     DEVICE,
+    EXECUTOR_TYPE,
     FIRST_CHUNK_GUIDANCE,
     FIRST_CHUNK_STEPS,
     FORWARDED_ALLOW_IPS,
@@ -76,12 +77,13 @@ from .voice_profiles import (
 from .worker import worker_init, worker_probe
 
 # ---------------------------------------------------------------------------
-# Multiprocessing spawn context (CUDA-safe)
+# Multiprocessing spawn context (CUDA-safe) — only needed for process executor
 # ---------------------------------------------------------------------------
-try:
-    mp.set_start_method("spawn", force=True)
-except RuntimeError:
-    pass
+if EXECUTOR_TYPE == "process":
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
 
 logger = logging.getLogger("omnivoice.server")
 
@@ -209,6 +211,7 @@ async def lifespan(app: FastAPI):
             DEFAULT_VOICE, default_voice,
         )
 
+    logger.info("  executor_type       : %s", EXECUTOR_TYPE)
     logger.info(
         "  Voice load plan     : %d cached  +  %d cold-build  =  %d total",
         cached_count, cold_count, len(profiles),
@@ -224,13 +227,16 @@ async def lifespan(app: FastAPI):
     )
 
     # ------------------------------------------------------------------
-    # Spawn worker processes
+    # Create executor — thread (default) or process
     # ------------------------------------------------------------------
-    executor = ProcessPoolExecutor(
-        max_workers=MAX_WORKERS,
-        mp_context=mp.get_context("spawn"),
-        initializer=worker_init,
-        initargs=(
+    if EXECUTOR_TYPE == "thread":
+        # Thread mode: load model in-process, share memory, no IPC overhead.
+        # GPU kernels release the GIL, so inference runs at full speed.
+        logger.info(
+            "  Loading model in-process (thread executor) …"
+        )
+        t_warm = time.perf_counter()
+        worker_init(
             MODEL_ID,
             device,
             ATTN_IMPL,
@@ -241,50 +247,79 @@ async def lifespan(app: FastAPI):
             default_voice,
             DEFAULT_LANGUAGE,
             MODEL_TYPE,
-        ),
-    )
-    logger.info("  ProcessPoolExecutor : %d worker(s) created (workers will spawn now)", MAX_WORKERS)
-
-    # ------------------------------------------------------------------
-    # FORCE every worker to spawn + run worker_init NOW, before we yield.
-    # ProcessPoolExecutor spawns lazily by default, so without this the
-    # very first request would pay the full model-load + compile cost.
-    # By awaiting MAX_WORKERS probe tasks, we guarantee the model is loaded,
-    # torch.compile has been applied, and pre-warm has finished BEFORE
-    # Uvicorn binds port 8000.
-    # ------------------------------------------------------------------
-    logger.info(
-        "  Loading model + warming up in %d worker(s) — port %s will open AFTER this completes …",
-        MAX_WORKERS, BIND_PORT,
-    )
-    t_warm = time.perf_counter()
-    loop = asyncio.get_running_loop()
-    try:
-        probe_results = await asyncio.gather(*[
-            loop.run_in_executor(executor, worker_probe)
-            for _ in range(MAX_WORKERS)
-        ])
-    except Exception as exc:
-        logger.exception("Worker initialisation FAILED — aborting startup.")
-        executor.shutdown(wait=False, cancel_futures=True)
-        raise RuntimeError(f"Worker initialisation failed: {exc}") from exc
-
-    warm_ms = (time.perf_counter() - t_warm) * 1000.0
-    for r in probe_results:
-        logger.info(
-            "  Worker[pid=%-6s]   : ready=%s  voices=%s  sr=%d",
-            r.get("pid"), r.get("ready"),
-            r.get("voices"), r.get("sample_rate", 0),
         )
-        if not r.get("ready"):
-            executor.shutdown(wait=False, cancel_futures=True)
+        warm_ms = (time.perf_counter() - t_warm) * 1000.0
+        logger.info("  Model + warm-up     : DONE in %.0f ms (in-process)", warm_ms)
+
+        probe_result = worker_probe()
+        if not probe_result.get("ready"):
             raise RuntimeError(
-                f"Worker pid={r.get('pid')} reported NOT ready — aborting startup."
+                "In-process worker reported NOT ready — aborting startup."
             )
-    # All workers reported ready
-    if probe_results:
-        tmp_sr = int(probe_results[0].get("sample_rate", tmp_sr))
-    logger.info("  Model + warm-up     : DONE in %.0f ms", warm_ms)
+        logger.info(
+            "  Worker[in-process]  : ready=%s  voices=%s  sr=%d",
+            probe_result.get("ready"),
+            probe_result.get("voices"), probe_result.get("sample_rate", 0),
+        )
+        tmp_sr = int(probe_result.get("sample_rate", tmp_sr))
+
+        executor = ThreadPoolExecutor(
+            max_workers=MAX_WORKERS,
+            thread_name_prefix="omnivoice-gpu",
+        )
+    else:
+        # Process mode: each worker loads its own model copy (multi-GPU safe).
+        executor = ProcessPoolExecutor(
+            max_workers=MAX_WORKERS,
+            mp_context=mp.get_context("spawn"),
+            initializer=worker_init,
+            initargs=(
+                MODEL_ID,
+                device,
+                ATTN_IMPL,
+                USE_SAGE_ATTN,
+                WEIGHT_DTYPE,
+                USE_TORCH_COMPILE,
+                voices_init,
+                default_voice,
+                DEFAULT_LANGUAGE,
+                MODEL_TYPE,
+            ),
+        )
+        logger.info("  ProcessPoolExecutor : %d worker(s) created (workers will spawn now)", MAX_WORKERS)
+
+        # FORCE every worker to spawn + run worker_init NOW, before we yield.
+        logger.info(
+            "  Loading model + warming up in %d worker(s) — port %s will open AFTER this completes …",
+            MAX_WORKERS, BIND_PORT,
+        )
+        t_warm = time.perf_counter()
+        loop = asyncio.get_running_loop()
+        try:
+            probe_results = await asyncio.gather(*[
+                loop.run_in_executor(executor, worker_probe)
+                for _ in range(MAX_WORKERS)
+            ])
+        except Exception as exc:
+            logger.exception("Worker initialisation FAILED — aborting startup.")
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise RuntimeError(f"Worker initialisation failed: {exc}") from exc
+
+        warm_ms = (time.perf_counter() - t_warm) * 1000.0
+        for r in probe_results:
+            logger.info(
+                "  Worker[pid=%-6s]   : ready=%s  voices=%s  sr=%d",
+                r.get("pid"), r.get("ready"),
+                r.get("voices"), r.get("sample_rate", 0),
+            )
+            if not r.get("ready"):
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise RuntimeError(
+                    f"Worker pid={r.get('pid')} reported NOT ready — aborting startup."
+                )
+        if probe_results:
+            tmp_sr = int(probe_results[0].get("sample_rate", tmp_sr))
+        logger.info("  Model + warm-up     : DONE in %.0f ms", warm_ms)
 
     # ------------------------------------------------------------------
     # Start dynamic batcher (only after workers are warm)

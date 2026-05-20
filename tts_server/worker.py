@@ -36,6 +36,7 @@ from omnivoice.models.omnivoice import (
 from .config import (
     MID_CHUNK_CFG,
     MODEL_TYPE,
+    SYNC_TIMING,
     TORCH_COMPILE_MODE,
     USE_CUDNN_BENCH,
     USE_TF32,
@@ -465,6 +466,13 @@ def worker_init(
         log.info("torch.compile skipped (incompatible with %s).", weight_dtype)
 
     # ---- Pre-warm at multiple batch sizes ----------------------------
+    # Use production-representative text lengths so cuDNN / CUDA Graph
+    # caches the best kernels for the shapes we actually see in production.
+    _WARM_TEXTS = [
+        "Welcome, how may I help?",                                     # ~25 chars (first-chunk)
+        "The quick brown fox jumps over the lazy dog near the river.",  # ~60 chars (rest-chunk)
+        "Please hold while I check your account details and verify the information you provided earlier today.",  # ~100 chars (long chunk)
+    ]
     warm_lang = _clean_language(default_language)
     log.info(
         "Pre-warming model (batch sizes 1, 2, 4)  default_lang=%s …",
@@ -474,8 +482,10 @@ def worker_init(
     warm_prompt = _prompts[_default_voice]
     for bs in (1, 2, 4):
         try:
+            # Cycle through representative text lengths
+            warm_batch = [_WARM_TEXTS[i % len(_WARM_TEXTS)] for i in range(bs)]
             _model.generate(
-                text=["Hello there."] * bs,
+                text=warm_batch,
                 language=warm_lang,
                 voice_clone_prompt=warm_prompt,
                 generation_config=cfg,
@@ -692,15 +702,125 @@ def worker_generate(
     if speed_arg is not None:
         gen_kwargs["speed"] = speed_arg
     audios = infer_model.generate(**gen_kwargs)
-        
-    if torch.cuda.is_available():
+
+    if SYNC_TIMING and torch.cuda.is_available():
         torch.cuda.synchronize()
     gen_ms = (time.perf_counter() - t0) * 1000.0
 
+    # Reuse a single BytesIO buffer to reduce GC pressure under load.
+    buf = io.BytesIO()
     wav_list: list[bytes] = []
     for audio in audios:
-        buf = io.BytesIO()
+        buf.seek(0)
+        buf.truncate(0)
         sf.write(buf, audio, _sr, format="WAV", subtype="PCM_16")
         wav_list.append(buf.getvalue())
 
     return wav_list, gen_ms
+
+
+def worker_generate_raw(
+    texts:        list[str],
+    cfg_dict:     dict,
+    languages:    Optional[list[Optional[str]]] = None,
+    voice_names:  Optional[list[Optional[str]]] = None,
+    speeds:       Optional[list[Optional[float]]] = None,
+    digit_words_langs: Optional[list[Optional[str]]] = None,
+    digit_words_hints: Optional[list[Optional[str]]] = None,
+    digit_pronunciations: Optional[list[Optional[str]]] = None,
+) -> tuple[list[np.ndarray], float]:
+    """Like :func:`worker_generate` but returns raw numpy arrays instead of
+    WAV-encoded bytes.  Used by the streaming pipeline to avoid redundant
+    WAV encode → decode → re-encode cycles.
+
+    Returns:
+        ``(audio_arrays, generation_ms)``  where each array is float32 1-D.
+    """
+    global _model, _prompts, _default_voice, _sr
+
+    if _model is None or not _prompts:
+        raise RuntimeError("Worker is not initialised. Call worker_init first.")
+
+    n = len(texts)
+    d_langs = list(digit_words_langs or [])[:n]
+    d_hints = list(digit_words_hints or [])[:n]
+    while len(d_langs) < n:
+        d_langs.append(None)
+    while len(d_hints) < n:
+        d_hints.append(None)
+    d_pros = list(digit_pronunciations or [])[:n]
+    while len(d_pros) < n:
+        d_pros.append(None)
+    texts = [
+        get_digit_to_word_service().normalize_for_tts(
+            t,
+            digit_pronunciation=dp,
+            digit_words_lang=dl,
+            digit_words_hint=dh,
+        )
+        for t, dl, dh, dp in zip(texts, d_langs, d_hints, d_pros)
+    ]
+
+    cfg = OmniVoiceGenerationConfig(**cfg_dict)
+
+    # ---- Resolve voice prompts per request --------------------------
+    if voice_names is None:
+        prompts = [_prompts[_default_voice]] * len(texts)
+    else:
+        prompts = []
+        for v in voice_names:
+            name = v or _default_voice
+            if name not in _prompts:
+                raise KeyError(
+                    f"Voice profile '{name}' not loaded in this worker. "
+                    f"Available: {sorted(_prompts.keys())}"
+                )
+            prompts.append(_prompts[name])
+
+    # ---- Resolve languages -----------------------------------------
+    cleaned_langs: Optional[list[Optional[str]]]
+    if languages is None:
+        cleaned_langs = None
+    else:
+        cleaned_langs = [_clean_language(l) for l in languages]
+
+    lang_arg: Any
+    if cleaned_langs is None or all(l is None for l in cleaned_langs):
+        lang_arg = None
+    elif len(set(cleaned_langs)) == 1:
+        lang_arg = cleaned_langs[0]
+    else:
+        lang_arg = list(cleaned_langs)
+
+    # ---- Resolve speed ---------------------------------------------
+    speed_arg: Any
+    if speeds is None or all(s is None for s in speeds):
+        speed_arg = None
+    elif len(set(speeds)) == 1:
+        s0 = speeds[0]
+        speed_arg = float(s0) if s0 is not None else None
+    else:
+        speed_arg = [float(s) if s is not None else None for s in speeds]
+
+    t0 = time.perf_counter()
+    infer_model = _model
+    if _model_type == "triton" and _model_triton is not None:
+        triton_model = getattr(_model_triton, "model", None)
+        if triton_model is not None:
+            infer_model = triton_model
+
+    gen_kwargs: dict[str, Any] = dict(
+        text=texts,
+        language=lang_arg,
+        voice_clone_prompt=prompts,
+        generation_config=cfg,
+    )
+    if speed_arg is not None:
+        gen_kwargs["speed"] = speed_arg
+    audios = infer_model.generate(**gen_kwargs)
+
+    if SYNC_TIMING and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    gen_ms = (time.perf_counter() - t0) * 1000.0
+
+    return audios, gen_ms

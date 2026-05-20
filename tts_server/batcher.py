@@ -26,12 +26,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import Executor
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
+
+import numpy as np
 
 from .config import FC_BATCH_TIMEOUT_MS, MAX_REST_BATCH, SORT_BATCH
-from .worker import worker_generate
+from .worker import worker_generate, worker_generate_raw
 
 logger = logging.getLogger("omnivoice.batcher")
 
@@ -48,6 +50,7 @@ class _SynthReq:
     speed:    Optional[float]
     future:   asyncio.Future
     is_fc:    bool  = False
+    is_raw:   bool  = False  # True → return np.ndarray instead of WAV bytes
     t_submit: float = field(default_factory=time.perf_counter)
     digit_words_lang:  Optional[str] = None
     digit_words_hint: Optional[str] = None
@@ -66,7 +69,7 @@ class DynamicBatcher:
 
     def __init__(
         self,
-        executor:   ProcessPoolExecutor,
+        executor:   Executor,
         max_batch:  int,
         timeout_ms: float,
     ) -> None:
@@ -121,7 +124,32 @@ class DynamicBatcher:
         await self._pq.put(_PrioItem(
             _PRIO_REST, self._seq,
             _SynthReq(text=text, cfg=cfg, language=language, voice=voice,
-                      speed=speed, future=fut, is_fc=False,
+                      speed=speed, future=fut, is_fc=False, is_raw=False,
+                      digit_words_lang=digit_words_lang,
+                      digit_words_hint=digit_words_hint,
+                      digit_pronunciation=digit_pronunciation),
+        ))
+        return await fut
+
+    async def submit_raw(
+        self,
+        text: str,
+        cfg: dict,
+        language: Optional[str] = None,
+        voice: Optional[str] = None,
+        speed: Optional[float] = None,
+        digit_words_lang: Optional[str] = None,
+        digit_words_hint: Optional[str] = None,
+        digit_pronunciation: Optional[str] = None,
+    ) -> np.ndarray:
+        """Enqueue a rest-chunk request returning a raw numpy array."""
+        loop = asyncio.get_running_loop()
+        fut  = loop.create_future()
+        self._seq += 1
+        await self._pq.put(_PrioItem(
+            _PRIO_REST, self._seq,
+            _SynthReq(text=text, cfg=cfg, language=language, voice=voice,
+                      speed=speed, future=fut, is_fc=False, is_raw=True,
                       digit_words_lang=digit_words_lang,
                       digit_words_hint=digit_words_hint,
                       digit_pronunciation=digit_pronunciation),
@@ -153,7 +181,35 @@ class DynamicBatcher:
         await self._pq.put(_PrioItem(
             _PRIO_FC, self._seq,
             _SynthReq(text=text, cfg=cfg, language=language, voice=voice,
-                      speed=speed, future=fut, is_fc=True,
+                      speed=speed, future=fut, is_fc=True, is_raw=False,
+                      digit_words_lang=digit_words_lang,
+                      digit_words_hint=digit_words_hint,
+                      digit_pronunciation=digit_pronunciation),
+        ))
+        return await fut
+
+    async def submit_first_chunk_raw(
+        self,
+        text: str,
+        cfg: dict,
+        language: Optional[str] = None,
+        voice: Optional[str] = None,
+        speed: Optional[float] = None,
+        digit_words_lang: Optional[str] = None,
+        digit_words_hint: Optional[str] = None,
+        digit_pronunciation: Optional[str] = None,
+    ) -> tuple[np.ndarray, float]:
+        """Submit a first-chunk request returning a raw numpy array.
+
+        Returns ``(audio_array, gen_ms_per_item)``.
+        """
+        loop = asyncio.get_running_loop()
+        fut  = loop.create_future()
+        self._seq += 1
+        await self._pq.put(_PrioItem(
+            _PRIO_FC, self._seq,
+            _SynthReq(text=text, cfg=cfg, language=language, voice=voice,
+                      speed=speed, future=fut, is_fc=True, is_raw=True,
                       digit_words_lang=digit_words_lang,
                       digit_words_hint=digit_words_hint,
                       digit_pronunciation=digit_pronunciation),
@@ -262,17 +318,20 @@ class DynamicBatcher:
         d_hints   = [r.digit_words_hint for r in batch]
         d_pros    = [r.digit_pronunciation for r in batch]
         cfg       = batch[0].cfg
+        use_raw   = all(r.is_raw for r in batch)
 
         logger.info(
-            "FC dispatch  size=%d  chars=%d..%d",
+            "FC dispatch  size=%d  chars=%d..%d  raw=%s",
             len(batch),
             min(len(t) for t in texts), max(len(t) for t in texts),
+            use_raw,
         )
 
         loop = asyncio.get_running_loop()
+        gen_func = worker_generate_raw if use_raw else worker_generate
         try:
-            wav_list, gen_ms = await loop.run_in_executor(
-                self._executor, worker_generate,
+            result_list, gen_ms = await loop.run_in_executor(
+                self._executor, gen_func,
                 texts, cfg, languages, voices, speeds, d_langs, d_hints, d_pros,
             )
             self.total_requests += len(batch)
@@ -284,9 +343,9 @@ class DynamicBatcher:
                 "FC done  size=%d  gen=%.1fms  (%.1fms/item)",
                 len(batch), gen_ms, per_gen,
             )
-            for req, wav_bytes in zip(batch, wav_list):
+            for req, result in zip(batch, result_list):
                 if not req.future.done():
-                    req.future.set_result((wav_bytes, per_gen))
+                    req.future.set_result((result, per_gen))
         except Exception as exc:
             logger.exception("FC dispatch error: %s", exc)
             for req in batch:
@@ -308,20 +367,32 @@ class DynamicBatcher:
         d_hints   = [r.digit_words_hint for r in ordered]
         d_pros    = [r.digit_pronunciation for r in ordered]
         cfg       = ordered[0].cfg
+        use_raw   = all(r.is_raw for r in ordered)
         avg_q     = sum(
             (time.perf_counter() - r.t_submit) * 1000 for r in ordered
         ) / len(ordered)
 
+        # ---- Length-bucketing metric (opt 2.3) ----
+        # Track padding overhead: ratio of max-length to average-length.
+        # A ratio of 1.0 means zero padding waste (ideal).
+        char_lens = [len(t) for t in texts]
+        max_chars = max(char_lens)
+        avg_chars = sum(char_lens) / len(char_lens)
+        padding_ratio = max_chars / avg_chars if avg_chars > 0 else 1.0
+
         logger.info(
-            "REST dispatch  size=%d  avg_queue=%.1fms  chars=%d..%d",
+            "REST dispatch  size=%d  avg_queue=%.1fms  chars=%d..%d  "
+            "pad_ratio=%.2f  raw=%s",
             len(ordered), avg_q,
-            min(len(t) for t in texts), max(len(t) for t in texts),
+            min(char_lens), max_chars,
+            padding_ratio, use_raw,
         )
 
         loop = asyncio.get_running_loop()
+        gen_func = worker_generate_raw if use_raw else worker_generate
         try:
-            wav_list, gen_ms = await loop.run_in_executor(
-                self._executor, worker_generate,
+            result_list, gen_ms = await loop.run_in_executor(
+                self._executor, gen_func,
                 texts, cfg, languages, voices, speeds, d_langs, d_hints, d_pros,
             )
             self.total_requests += len(ordered)
@@ -332,11 +403,13 @@ class DynamicBatcher:
                 "REST done  size=%d  gen=%.1fms  (%.1fms/text)",
                 len(ordered), gen_ms, gen_ms / len(ordered),
             )
-            for req, wav_bytes in zip(ordered, wav_list):
+            for req, result in zip(ordered, result_list):
                 if not req.future.done():
-                    req.future.set_result(wav_bytes)
+                    req.future.set_result(result)
         except Exception as exc:
             logger.exception("REST dispatch error: %s", exc)
             for req in ordered:
                 if not req.future.done():
                     req.future.set_exception(exc)
+
+

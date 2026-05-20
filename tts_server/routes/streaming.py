@@ -40,12 +40,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import struct
 import time
 from typing import Optional
 
+import numpy as np
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from ..audio_utils import Crossfader, b64_encode, np_to_wav_bytes, wav_bytes_to_np
+from ..audio_utils import Crossfader, b64_encode, np_to_wav_bytes
 from ..config import (
     CROSSFADE_MS,
     DEFAULT_LANGUAGE,
@@ -191,6 +193,20 @@ logger = logging.getLogger("omnivoice.streaming")
 
 router = APIRouter()
 
+# Binary WebSocket frame header format (8 bytes, little-endian):
+#   chunk_index  : uint16  (0-65535)
+#   flags        : uint16  (bit 0 = is_last, bit 1 = is_first)
+#   sample_count : uint32  (number of PCM16 samples in this frame)
+_BIN_HEADER = struct.Struct("<HHI")
+_FLAG_FIRST = 0x02
+_FLAG_LAST  = 0x01
+
+
+def _np_to_pcm16_bytes(audio: np.ndarray) -> bytes:
+    """Convert float32 audio to raw PCM16 little-endian bytes (no WAV header)."""
+    pcm16 = np.clip(audio * 32767.0, -32768, 32767).astype("<i2")
+    return pcm16.tobytes()
+
 
 def _coerce_opt_str(raw) -> Optional[str]:
     if raw is None:
@@ -279,6 +295,11 @@ async def ws_tts(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "message": epochs_err})
                 continue
 
+            # Binary audio transport (opt 2.2): client opts in per-request.
+            # Binary mode sends raw PCM16 as WebSocket binary frames with an
+            # 8-byte header, eliminating base64 + WAV overhead (~60% smaller).
+            binary_audio: bool = bool(msg.get("binary_audio", False))
+
             fc_cfg = cfg_with_epochs(FIRST_CHUNK_CFG, epochs_fc)
 
             logger.info(
@@ -322,7 +343,7 @@ async def ws_tts(websocket: WebSocket):
 
             t_first_await_start = time.perf_counter()
             try:
-                first_wav, first_gen_ms = await batcher.submit_first_chunk(
+                first_audio_raw, first_gen_ms = await batcher.submit_first_chunk_raw(
                     first_text, fc_cfg,
                     language=language, voice=voice, speed=speed,
                     digit_words_lang=digit_words_lang,
@@ -334,8 +355,8 @@ async def ws_tts(websocket: WebSocket):
                 continue
             gen_end = time.perf_counter()
 
-            first_audio, _ = wav_bytes_to_np(first_wav)
-            first_audio = xfader.process(first_audio, is_first=True, is_last=(n == 1))
+            # Raw numpy path — no WAV decode needed
+            first_audio = xfader.process(first_audio_raw, is_first=True, is_last=(n == 1))
             total_samples += len(first_audio)
             first_latency_ms = (gen_end - t_req) * 1000.0
 
@@ -352,29 +373,55 @@ async def ws_tts(websocket: WebSocket):
                 chunk_wall_ms - first_gen_ms, chunk_audio_ms, first_text,
             )
 
-            wav_out = np_to_wav_bytes(first_audio, sample_rate)
-            await websocket.send_json({
-                "type":                   "response.audio.delta",
-                "delta":                  b64_encode(wav_out),
-                "encoding":               "wav/pcm16",
-                "sample_rate":            sample_rate,
-                "chunk_index":            0,
-                "chunk_text":             first_text,
-                "chunk_audio_ms":         round(chunk_audio_ms, 1),
-                "chunk_audio_sec":        round(chunk_audio_ms / 1000.0, 3),
-                "chunk_gen_ms":           round(first_gen_ms, 1),
-                "chunk_wall_ms":          round(chunk_wall_ms, 1),
-                "since_prev_chunk_ms":    None,
-                "since_request_ms":       round(since_request_ms, 1),
-                "cumulative_audio_ms":    round(cumulative_audio_ms, 1),
-                "cumulative_audio_sec":   round(cumulative_audio_ms / 1000.0, 3),
-                "language":               language or "auto",
-                "voice":                  voice,
-                "speed":                  speed,
-                "model_type":             model_type,
-                "first_chunk_latency_ms": round(first_latency_ms, 1),
-                "epochs":                 int(fc_cfg["num_step"]),
-            })
+            # Encode to WAV only once, right before sending
+            if binary_audio:
+                # Binary mode: send raw PCM16 + separate JSON metadata
+                pcm_bytes = _np_to_pcm16_bytes(first_audio)
+                flags = _FLAG_FIRST | (_FLAG_LAST if n == 1 else 0)
+                header = _BIN_HEADER.pack(0, flags, len(first_audio))
+                await websocket.send_bytes(header + pcm_bytes)
+                await websocket.send_json({
+                    "type":                   "response.audio.meta",
+                    "chunk_index":            0,
+                    "chunk_text":             first_text,
+                    "chunk_audio_ms":         round(chunk_audio_ms, 1),
+                    "chunk_gen_ms":           round(first_gen_ms, 1),
+                    "chunk_wall_ms":          round(chunk_wall_ms, 1),
+                    "since_request_ms":       round(since_request_ms, 1),
+                    "cumulative_audio_ms":    round(cumulative_audio_ms, 1),
+                    "sample_rate":            sample_rate,
+                    "language":               language or "auto",
+                    "voice":                  voice,
+                    "speed":                  speed,
+                    "model_type":             model_type,
+                    "first_chunk_latency_ms": round(first_latency_ms, 1),
+                    "epochs":                 int(fc_cfg["num_step"]),
+                })
+            else:
+                wav_out = np_to_wav_bytes(first_audio, sample_rate)
+                # First chunk includes full static metadata; subsequent chunks omit it (3.4)
+                await websocket.send_json({
+                    "type":                   "response.audio.delta",
+                    "delta":                  b64_encode(wav_out),
+                    "encoding":               "wav/pcm16",
+                    "sample_rate":            sample_rate,
+                    "chunk_index":            0,
+                    "chunk_text":             first_text,
+                    "chunk_audio_ms":         round(chunk_audio_ms, 1),
+                    "chunk_audio_sec":        round(chunk_audio_ms / 1000.0, 3),
+                    "chunk_gen_ms":           round(first_gen_ms, 1),
+                    "chunk_wall_ms":          round(chunk_wall_ms, 1),
+                    "since_prev_chunk_ms":    None,
+                    "since_request_ms":       round(since_request_ms, 1),
+                    "cumulative_audio_ms":    round(cumulative_audio_ms, 1),
+                    "cumulative_audio_sec":   round(cumulative_audio_ms / 1000.0, 3),
+                    "language":               language or "auto",
+                    "voice":                  voice,
+                    "speed":                  speed,
+                    "model_type":             model_type,
+                    "first_chunk_latency_ms": round(first_latency_ms, 1),
+                    "epochs":                 int(fc_cfg["num_step"]),
+                })
 
             # NOW that the first chunk is sent, pre-submit chunk 1.
             # This is intentionally deferred: submitting before the
@@ -384,7 +431,7 @@ async def ws_tts(websocket: WebSocket):
                 base_1 = LAST_CHUNK_CFG if n == 2 else MID_CHUNK_CFG
                 cfg_1 = cfg_with_epochs(base_1, epochs_rest)
                 prefetch_task = asyncio.create_task(
-                    batcher.submit(
+                    batcher.submit_raw(
                         all_chunks[1], cfg_1,
                         language=language, voice=voice, speed=speed,
                         digit_words_lang=digit_words_lang,
@@ -402,14 +449,14 @@ async def ws_tts(websocket: WebSocket):
                 t_await_start = time.perf_counter()
                 if prefetch_task is not None:
                     try:
-                        wav_bytes = await prefetch_task
+                        audio_raw = await prefetch_task
                     except Exception as exc:
                         await websocket.send_json({"type": "error", "message": str(exc)})
                         break
                 else:
                     base_i = LAST_CHUNK_CFG if is_last else MID_CHUNK_CFG
                     cfg_i = cfg_with_epochs(base_i, epochs_rest)
-                    wav_bytes = await batcher.submit(
+                    audio_raw = await batcher.submit_raw(
                         all_chunks[i], cfg_i,
                         language=language, voice=voice, speed=speed,
                         digit_words_lang=digit_words_lang,
@@ -425,7 +472,7 @@ async def ws_tts(websocket: WebSocket):
                     )
                     cfg_next = cfg_with_epochs(base_next, epochs_rest)
                     prefetch_task = asyncio.create_task(
-                        batcher.submit(
+                        batcher.submit_raw(
                             all_chunks[i + 1], cfg_next,
                             language=language, voice=voice, speed=speed,
                             digit_words_lang=digit_words_lang,
@@ -434,15 +481,14 @@ async def ws_tts(websocket: WebSocket):
                         )
                     )
 
-                audio, sr = wav_bytes_to_np(wav_bytes)
-                audio = xfader.process(audio, is_first=False, is_last=is_last)
+                # Raw numpy path — no WAV decode needed
+                audio = xfader.process(audio_raw, is_first=False, is_last=is_last)
                 total_samples += len(audio)
-                sr_eff = sr or sample_rate
 
                 chunk_wall_ms       = (gen_end - t_await_start) * 1000.0
                 since_prev_chunk_ms = (gen_end - prev_gen_end) * 1000.0 if prev_gen_end else 0.0
                 since_request_ms    = (gen_end - t_req) * 1000.0
-                chunk_audio_ms      = len(audio) / sr_eff * 1000.0
+                chunk_audio_ms      = len(audio) / sample_rate * 1000.0
                 cumulative_audio_ms += chunk_audio_ms
                 prev_gen_end = gen_end
 
@@ -459,28 +505,44 @@ async def ws_tts(websocket: WebSocket):
                     chunk_audio_ms,
                 )
 
-                wav_out = np_to_wav_bytes(audio, sr_eff)
-                await websocket.send_json({
-                    "type":                 "response.audio.delta",
-                    "delta":                b64_encode(wav_out),
-                    "encoding":             "wav/pcm16",
-                    "sample_rate":          sr_eff,
-                    "chunk_index":          i,
-                    "chunk_text":           all_chunks[i],
-                    "chunk_audio_ms":       round(chunk_audio_ms, 1),
-                    "chunk_audio_sec":      round(chunk_audio_ms / 1000.0, 3),
-                    "chunk_gen_ms":         round(chunk_wall_ms, 1),
-                    "chunk_wall_ms":        round(chunk_wall_ms, 1),
-                    "since_prev_chunk_ms":  round(since_prev_chunk_ms, 1),
-                    "since_request_ms":     round(since_request_ms, 1),
-                    "cumulative_audio_ms":  round(cumulative_audio_ms, 1),
-                    "cumulative_audio_sec": round(cumulative_audio_ms / 1000.0, 3),
-                    "language":             language or "auto",
-                    "voice":                voice,
-                    "speed":                speed,
-                    "model_type":           model_type,
-                    "epochs":               epochs_this,
-                })
+                # Encode to WAV only once, right before sending
+                if binary_audio:
+                    pcm_bytes = _np_to_pcm16_bytes(audio)
+                    flags = (_FLAG_FIRST if i == 0 else 0) | (_FLAG_LAST if is_last else 0)
+                    header = _BIN_HEADER.pack(i, flags, len(audio))
+                    await websocket.send_bytes(header + pcm_bytes)
+                    await websocket.send_json({
+                        "type":                 "response.audio.meta",
+                        "chunk_index":          i,
+                        "chunk_text":           all_chunks[i],
+                        "chunk_audio_ms":       round(chunk_audio_ms, 1),
+                        "chunk_gen_ms":         round(chunk_wall_ms, 1),
+                        "chunk_wall_ms":        round(chunk_wall_ms, 1),
+                        "since_prev_chunk_ms":  round(since_prev_chunk_ms, 1),
+                        "since_request_ms":     round(since_request_ms, 1),
+                        "cumulative_audio_ms":  round(cumulative_audio_ms, 1),
+                        "epochs":               epochs_this,
+                    })
+                else:
+                    wav_out = np_to_wav_bytes(audio, sample_rate)
+                    # Slim payload — omit static metadata already sent in chunk 0 (3.4)
+                    await websocket.send_json({
+                        "type":                 "response.audio.delta",
+                        "delta":                b64_encode(wav_out),
+                        "encoding":             "wav/pcm16",
+                        "sample_rate":          sample_rate,
+                        "chunk_index":          i,
+                        "chunk_text":           all_chunks[i],
+                        "chunk_audio_ms":       round(chunk_audio_ms, 1),
+                        "chunk_audio_sec":      round(chunk_audio_ms / 1000.0, 3),
+                        "chunk_gen_ms":         round(chunk_wall_ms, 1),
+                        "chunk_wall_ms":        round(chunk_wall_ms, 1),
+                        "since_prev_chunk_ms":  round(since_prev_chunk_ms, 1),
+                        "since_request_ms":     round(since_request_ms, 1),
+                        "cumulative_audio_ms":  round(cumulative_audio_ms, 1),
+                        "cumulative_audio_sec": round(cumulative_audio_ms / 1000.0, 3),
+                        "epochs":               epochs_this,
+                    })
 
             tail = xfader.flush()
             if tail is not None:

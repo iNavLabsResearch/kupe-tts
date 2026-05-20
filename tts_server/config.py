@@ -199,6 +199,20 @@ USE_TORCH_COMPILE: bool = os.getenv("OMNIVOICE_COMPILE",     "1") == "1"
 SORT_BATCH:        bool = os.getenv("OMNIVOICE_SORT_BATCH",  "1") == "1"
 TORCH_COMPILE_MODE: str = os.getenv("OMNIVOICE_COMPILE_MODE", "reduce-overhead")
 
+# Synchronise CUDA before timing measurements.  Adds ~0.5-1 ms of stall but
+# gives precise GPU timing.  Disable in production for lower latency.
+SYNC_TIMING: bool = os.getenv("OMNIVOICE_SYNC_TIMING", "0") == "1"
+
+# Executor backend: "thread" (single-GPU, shared memory, lower overhead) or
+# "process" (multi-GPU safe, uses mp.spawn).  Default "thread" for single-GPU.
+_RAW_EXECUTOR_TYPE = os.getenv("OMNIVOICE_EXECUTOR", "thread").strip().lower()
+if _RAW_EXECUTOR_TYPE not in ("thread", "process"):
+    raise ValueError(
+        f"OMNIVOICE_EXECUTOR='{_RAW_EXECUTOR_TYPE}' is invalid. "
+        f"Accepted values: 'thread', 'process'."
+    )
+EXECUTOR_TYPE: str = _RAW_EXECUTOR_TYPE
+
 # ---------------------------------------------------------------------------
 # Streaming / crossfade
 # ---------------------------------------------------------------------------
@@ -215,6 +229,14 @@ FIRST_CHUNK_GUIDANCE: float = float(os.getenv("OMNIVOICE_FIRST_CHUNK_GUIDANCE", 
 # a solid quality / speed trade-off; tune down (e.g. 8) for busier GPUs.
 REST_CHUNK_STEPS: int = max(1, int(os.getenv("OMNIVOICE_REST_CHUNK_STEPS", "16")))
 
+# Adaptive early exit: skip remaining diffusion steps when the fraction of
+# still-masked tokens drops below this value for ALL items in the batch.
+# 0.0 = disabled (always run all steps).  0.02 = exit when ≤2% tokens remain
+# masked, typically saving 1-3 forward passes with minimal quality impact.
+EARLY_EXIT_THRESHOLD: float = max(0.0, float(
+    os.getenv("OMNIVOICE_EARLY_EXIT", "0.0")
+))
+
 # ---------------------------------------------------------------------------
 # Generation config dicts (plain dicts for safe pickling across processes)
 # ---------------------------------------------------------------------------
@@ -227,6 +249,7 @@ FIRST_CHUNK_CFG: dict = dict(
     layer_penalty_factor=5.0,
     position_temperature=5.0,
     class_temperature=0.0,
+    early_exit_threshold=EARLY_EXIT_THRESHOLD,
 )
 
 MID_CHUNK_CFG: dict = dict(
@@ -238,6 +261,7 @@ MID_CHUNK_CFG: dict = dict(
     layer_penalty_factor=5.0,
     position_temperature=5.0,
     class_temperature=0.0,
+    early_exit_threshold=EARLY_EXIT_THRESHOLD,
 )
 
 LAST_CHUNK_CFG: dict = dict(
@@ -249,6 +273,7 @@ LAST_CHUNK_CFG: dict = dict(
     layer_penalty_factor=5.0,
     position_temperature=5.0,
     class_temperature=0.0,
+    early_exit_threshold=EARLY_EXIT_THRESHOLD,
 )
 
 # ---------------------------------------------------------------------------

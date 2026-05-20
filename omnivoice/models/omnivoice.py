@@ -107,6 +107,11 @@ class OmniVoiceGenerationConfig:
     postprocess_output: bool = True
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
+    # Adaptive early exit: skip remaining steps when the fraction of still-
+    # masked tokens drops below this threshold for ALL items in the batch.
+    # 0.0 = disabled (always run all num_step steps).
+    # 0.02 = exit when ≤2% tokens remain masked (saves ~1-3 steps typically).
+    early_exit_threshold: float = 0.0
 
     @classmethod
     def from_dict(cls, kwargs_dict):
@@ -1252,6 +1257,27 @@ class OmniVoice(PreTrainedModel):
         ).view(1, -1, 1)
 
         for step in range(gen_config.num_step):
+            # ---- Adaptive early exit (opt 2.1) ----
+            # If all batch items have unmasked enough tokens, skip remaining
+            # forward passes.  Controlled by early_exit_threshold (default 0 = off).
+            if step > 0 and gen_config.early_exit_threshold > 0.0:
+                all_done = True
+                for i in range(B):
+                    t_len = task.target_lens[i]
+                    total_positions = t_len * self.config.num_audio_codebook
+                    remaining_masks = (
+                        tokens[i, :, :t_len] == self.config.audio_mask_id
+                    ).sum().item()
+                    if remaining_masks / total_positions > gen_config.early_exit_threshold:
+                        all_done = False
+                        break
+                if all_done:
+                    logger.debug(
+                        "Early exit at step %d/%d (mask ratio below %.3f for all items)",
+                        step, gen_config.num_step, gen_config.early_exit_threshold,
+                    )
+                    break
+
             batch_logits = self(
                 input_ids=batch_input_ids,
                 audio_mask=batch_audio_mask,
