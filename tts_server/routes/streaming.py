@@ -61,132 +61,9 @@ from ..config import (
     SPEED_MIN,
     cfg_with_epochs,
 )
+from ..domain.request_policies import coerce_opt_str, coerce_speed, coerce_text, resolve_fc_rest_epochs
 from ..lang_utils import resolve_language
 from ..text_utils import split_first_chunk_early, split_to_chunks
-
-
-def _coerce_text(raw) -> str:
-    """Robustly convert any ``msg["text"]`` payload into a single string.
-
-    Accepts plain strings, lists/tuples (joined with spaces), or coerces other
-    types via ``str(...)``.  Returns the trimmed string, or ``""`` on None.
-    """
-    if raw is None:
-        return ""
-    if isinstance(raw, str):
-        return raw.strip()
-    if isinstance(raw, (list, tuple)):
-        return " ".join(str(part).strip() for part in raw if part is not None).strip()
-    return str(raw).strip()
-
-
-def _coerce_speed(raw) -> tuple[Optional[float], Optional[str]]:
-    """Validate a user-supplied speed value.
-
-    Returns ``(speed, error_message)``.  ``speed`` is ``None`` when the user
-    didn't provide a value (server falls back to DEFAULT_SPEED).
-    """
-    if raw is None:
-        return None, None
-    if isinstance(raw, str):
-        s = raw.strip().lower()
-        if s in ("", "default", "none", "auto"):
-            return None, None
-        try:
-            raw = float(s)
-        except ValueError:
-            return None, f"speed must be a number, got {raw!r}"
-    try:
-        v = float(raw)
-    except (TypeError, ValueError):
-        return None, f"speed must be a number, got {raw!r}"
-    if not (SPEED_MIN <= v <= SPEED_MAX):
-        return None, f"speed {v} is out of range [{SPEED_MIN}, {SPEED_MAX}]"
-    return v, None
-
-
-def _coerce_epochs(raw) -> tuple[Optional[int], Optional[str]]:
-    """Validate client ``epochs`` / ``inference_steps`` (maps to ``num_step``)."""
-    if raw is None:
-        return None, None
-    if isinstance(raw, str):
-        s = raw.strip().lower()
-        if s in ("", "default", "none", "auto"):
-            return None, None
-        try:
-            raw = int(s, 10)
-        except ValueError:
-            return None, f"epochs must be an integer, got {raw!r}"
-    try:
-        v = int(raw)
-    except (TypeError, ValueError):
-        return None, f"epochs must be an integer, got {raw!r}"
-    if not (EPOCHS_MIN <= v <= EPOCHS_MAX):
-        return None, f"epochs {v} is out of range [{EPOCHS_MIN}, {EPOCHS_MAX}]"
-    return v, None
-
-
-def _epochs_field_provided(raw) -> bool:
-    """True when the client sent a value other than 'use server default' sentinels."""
-    if raw is None:
-        return False
-    if isinstance(raw, str) and raw.strip().lower() in ("", "default", "none", "auto"):
-        return False
-    return True
-
-
-def _resolve_fc_rest_epochs(msg: dict) -> tuple[Optional[int], Optional[int], Optional[str]]:
-    """Derive first-chunk and rest-chunk ``num_step`` overrides from the WS payload.
-
-    Precedence:
-      * ``epochs_fc`` / ``first_chunk_epochs`` applies to chunk 0 only.
-      * ``epochs_rest`` / ``rest_chunk_epochs`` / ``mid_chunk_epochs`` applies to chunks ≥1.
-      * ``epochs`` / ``inference_steps`` fills whichever of the above was **not** explicitly set.
-    """
-    raw_fc = (
-        msg.get("epochs_fc")
-        or msg.get("first_chunk_epochs")
-        or msg.get("firstChunkEpochs")
-    )
-    raw_rest = (
-        msg.get("epochs_rest")
-        or msg.get("rest_chunk_epochs")
-        or msg.get("restChunkEpochs")
-        or msg.get("mid_chunk_epochs")
-    )
-    raw_legacy = msg.get("epochs")
-    if raw_legacy is None:
-        raw_legacy = msg.get("inference_steps", msg.get("inferenceSteps"))
-
-    fc_opt: Optional[int]
-    rest_opt: Optional[int]
-
-    if _epochs_field_provided(raw_fc):
-        fc_opt, err = _coerce_epochs(raw_fc)
-        if err:
-            return None, None, err
-    else:
-        fc_opt = None
-
-    if _epochs_field_provided(raw_rest):
-        rest_opt, err = _coerce_epochs(raw_rest)
-        if err:
-            return None, None, err
-    else:
-        rest_opt = None
-
-    leg_opt: Optional[int] = None
-    if _epochs_field_provided(raw_legacy):
-        leg_opt, err = _coerce_epochs(raw_legacy)
-        if err:
-            return None, None, err
-
-    if fc_opt is None:
-        fc_opt = leg_opt
-    if rest_opt is None:
-        rest_opt = leg_opt
-
-    return fc_opt, rest_opt, None
 
 
 logger = logging.getLogger("omnivoice.streaming")
@@ -206,13 +83,6 @@ def _np_to_pcm16_bytes(audio: np.ndarray) -> bytes:
     """Convert float32 audio to raw PCM16 little-endian bytes (no WAV header)."""
     pcm16 = np.clip(audio * 32767.0, -32768, 32767).astype("<i2")
     return pcm16.tobytes()
-
-
-def _coerce_opt_str(raw) -> Optional[str]:
-    if raw is None:
-        return None
-    s = str(raw).strip()
-    return s or None
 
 
 @router.websocket("/ws/tts")
@@ -290,7 +160,7 @@ async def ws_tts(websocket: WebSocket):
                 msg.get("digit_pronunciation") or msg.get("digitPronunciation")
             )
 
-            epochs_fc, epochs_rest, epochs_err = _resolve_fc_rest_epochs(msg)
+            epochs_fc, epochs_rest, epochs_err = resolve_fc_rest_epochs(msg)
             if epochs_err:
                 await websocket.send_json({"type": "error", "message": epochs_err})
                 continue

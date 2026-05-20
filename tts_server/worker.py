@@ -42,6 +42,9 @@ from .config import (
     USE_TF32,
 )
 from .digit_to_words import get_digit_to_word_service
+from .runtime.model_loader import attach_triton_hybrid, build_load_kwargs, load_model
+from .runtime.perf import apply_torch_perf_flags, patch_sage_attention
+from .runtime.prompts import resolve_voice_prompt
 from .voice_profiles import VoiceEmbedding
 
 log = logging.getLogger("omnivoice.worker")
@@ -88,64 +91,14 @@ def patch_sage_attention(enable: bool) -> None:
     and forwards everything else to the original SDPA so OmniVoice's block-padding
     attention masks keep working.
     """
-    if not enable:
-        log.info("SageAttention disabled.")
-        return
-    try:
-        from sageattention import sageattn  # type: ignore[import]
-    except ImportError:
-        log.warning("SageAttention requested but not installed — using SDPA.")
-        return
-
-    import torch.nn.functional as F
-
-    _orig_sdpa = F.scaled_dot_product_attention
-
-    def _smart_sdpa(
-        query, key, value,
-        attn_mask=None, dropout_p=0.0, is_causal=False,
-        scale=None, enable_gqa=False,
-    ):
-        if (
-            attn_mask is None
-            and dropout_p == 0.0
-            and query.dim() == 4
-            and query.dtype in (torch.float16, torch.bfloat16)
-            and query.is_cuda
-        ):
-            try:
-                return sageattn(
-                    query, key, value,
-                    tensor_layout="HND",
-                    is_causal=is_causal,
-                    sm_scale=scale,
-                )
-            except Exception:
-                pass
-        return _orig_sdpa(
-            query, key, value,
-            attn_mask=attn_mask, dropout_p=dropout_p,
-            is_causal=is_causal, scale=scale, enable_gqa=enable_gqa,
-        )
-
-    F.scaled_dot_product_attention = _smart_sdpa  # type: ignore[assignment]
-    torch.nn.functional.scaled_dot_product_attention = _smart_sdpa
-    log.info("SageAttention: smart SDPA wrapper installed.")
+    from .runtime.perf import patch_sage_attention as _patch
+    _patch(enable)
 
 
 def apply_torch_perf_flags() -> None:
     """Free GPU speedups: TF32, cuDNN benchmark, matmul precision."""
-    if not torch.cuda.is_available():
-        return
-    if USE_TF32:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-    if USE_CUDNN_BENCH:
-        torch.backends.cudnn.benchmark = True
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
+    from .runtime.perf import apply_torch_perf_flags as _apply
+    _apply()
 
 
 # ---------------------------------------------------------------------------
@@ -158,85 +111,18 @@ def _build_load_kwargs(
     attn_impl:     str,
 ) -> dict:
     """Translate ``WEIGHT_DTYPE`` into ``OmniVoice.from_pretrained`` kwargs."""
-    load_kw: dict[str, Any] = {"device_map": device}
-
-    if device == "cpu":
-        # bitsandbytes & fp16/bf16 require CUDA
-        load_kw["dtype"] = torch.float32
-        if weight_dtype != "fp32":
-            log.warning(
-                "device=cpu does not support %s; falling back to fp32.",
-                weight_dtype,
-            )
-    elif weight_dtype == "fp32":
-        load_kw["dtype"] = torch.float32
-    elif weight_dtype == "fp16":
-        load_kw["dtype"] = torch.float16
-    elif weight_dtype == "bf16":
-        load_kw["dtype"] = torch.bfloat16
-    elif weight_dtype in ("int8", "int4"):
-        try:
-            from transformers import BitsAndBytesConfig  # type: ignore[import]
-        except ImportError as exc:
-            raise RuntimeError(
-                f"OMNIVOICE_WEIGHT_DTYPE={weight_dtype!r} requires "
-                f"`transformers` and `bitsandbytes`. "
-                f"Install: pip install bitsandbytes"
-            ) from exc
-
-        if weight_dtype == "int8":
-            load_kw["quantization_config"] = BitsAndBytesConfig(
-                load_in_8bit=True,
-                bnb_8bit_compute_dtype=torch.float16,
-            )
-        else:  # int4
-            load_kw["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=torch.float16,
-            )
-        # bitsandbytes overrides dtype, but compute_dtype is fp16
-        load_kw["dtype"] = torch.float16
-    else:
-        load_kw["dtype"] = torch.float16
-
-    if attn_impl and attn_impl not in ("auto", ""):
-        load_kw["attn_implementation"] = attn_impl
-
-    return load_kw
+    return build_load_kwargs(device, weight_dtype, attn_impl)
 
 
 def _load_model(model_id: str, load_kw: dict) -> OmniVoice:
     """Load OmniVoice, gracefully retrying without ``attn_implementation``
     if the checkpoint metadata doesn't accept it."""
-    try:
-        return OmniVoice.from_pretrained(model_id, **load_kw)
-    except TypeError:
-        load_kw.pop("attn_implementation", None)
-        log.warning("attn_implementation kwarg not accepted; retrying without it.")
-        return OmniVoice.from_pretrained(model_id, **load_kw)
+    return load_model(model_id, load_kw)
 
 
 def _attach_triton_hybrid(runner: Any, model: OmniVoice, *, enable_sage: bool) -> None:
     """Apply hybrid (Triton kernels + CUDA Graph) optimizations to an already-loaded model."""
-    from omnivoice_triton.models.faster_runner import _CUDAGraphForward
-    from omnivoice_triton.models.patching import (
-        apply_sage_attention,
-        apply_triton_kernels,
-        find_patchable_model,
-    )
-
-    runner._model = model
-    patch_range = getattr(runner, "patch_range", (0, 24))
-    patchable = find_patchable_model(model)
-    apply_triton_kernels(patchable, patch_range=patch_range)
-    if enable_sage:
-        apply_sage_attention(patchable, patch_range=patch_range)
-    graph_forward = _CUDAGraphForward(model)
-    model.forward = graph_forward  # type: ignore[method-assign]
-    runner._graph_forward = graph_forward
-    log.info("Triton hybrid runner attached to loaded OmniVoice model.")
+    attach_triton_hybrid(runner, model, enable_sage=enable_sage)
 
 
 # ---------------------------------------------------------------------------
@@ -312,39 +198,7 @@ def _resolve_voice_prompt(
              "cache_save_path": str | None,
            }
     """
-    cached = spec.get("cached_embedding")
-    if cached is not None:
-        log.info("[%s] Restoring voice prompt from cached embedding.", name)
-        embedding = VoiceEmbedding(
-            ref_audio_tokens=np.asarray(cached["ref_audio_tokens"], dtype=np.int64),
-            ref_text=str(cached["ref_text"]),
-            ref_rms=float(cached["ref_rms"]),
-            sampling_rate=int(cached["sampling_rate"]),
-            model_id=str(cached["model_id"]),
-            num_codebooks=int(cached["num_codebooks"]),
-            num_tokens=int(cached["num_tokens"]),
-        )
-        return _build_prompt_from_embedding(model, embedding)
-
-    raw_bytes = spec.get("raw_ref_bytes")
-    raw_sr    = spec.get("raw_ref_sr")
-    raw_text  = spec.get("raw_ref_text")
-    if raw_bytes is None or raw_sr is None:
-        raise RuntimeError(
-            f"Voice '{name}' has neither a cached embedding nor raw reference audio."
-        )
-    log.info("[%s] Building voice prompt from raw audio (cold path) …", name)
-    prompt, embedding = _build_prompt_from_audio(model, raw_bytes, int(raw_sr), raw_text)
-    embedding.model_id = model_id
-
-    cache_save_path = spec.get("cache_save_path")
-    if cache_save_path:
-        try:
-            embedding.to_npz(Path(cache_save_path))
-            log.info("[%s] Saved voice embedding cache → %s", name, cache_save_path)
-        except Exception as exc:
-            log.warning("[%s] Failed to save embedding cache: %s", name, exc)
-    return prompt
+    return resolve_voice_prompt(model, name, spec, model_id)
 
 
 def worker_init(

@@ -33,7 +33,7 @@ from typing import Optional, Union
 import numpy as np
 
 from .config import FC_BATCH_TIMEOUT_MS, MAX_REST_BATCH, SORT_BATCH
-from .worker import worker_generate, worker_generate_raw
+from .runtime.protocols import RuntimeExecutor, WorkerRuntimeExecutor
 
 logger = logging.getLogger("omnivoice.batcher")
 
@@ -72,12 +72,14 @@ class DynamicBatcher:
         executor:   Executor,
         max_batch:  int,
         timeout_ms: float,
+        runtime_executor: RuntimeExecutor | None = None,
     ) -> None:
         self._executor       = executor
         self._max_batch      = max_batch
         self._timeout        = timeout_ms / 1000.0
         self._fc_timeout     = FC_BATCH_TIMEOUT_MS / 1000.0
         self._max_rest_batch = MAX_REST_BATCH
+        self._runtime = runtime_executor or WorkerRuntimeExecutor()
 
         self._pq: asyncio.PriorityQueue[_PrioItem] = asyncio.PriorityQueue()
         self._seq  = 0
@@ -328,7 +330,7 @@ class DynamicBatcher:
         )
 
         loop = asyncio.get_running_loop()
-        gen_func = worker_generate_raw if use_raw else worker_generate
+        gen_func = self._runtime.generate_raw if use_raw else self._runtime.generate
         try:
             result_list, gen_ms = await loop.run_in_executor(
                 self._executor, gen_func,
@@ -389,7 +391,7 @@ class DynamicBatcher:
         )
 
         loop = asyncio.get_running_loop()
-        gen_func = worker_generate_raw if use_raw else worker_generate
+        gen_func = self._runtime.generate_raw if use_raw else self._runtime.generate
         try:
             result_list, gen_ms = await loop.run_in_executor(
                 self._executor, gen_func,
