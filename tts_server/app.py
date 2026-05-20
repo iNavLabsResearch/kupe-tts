@@ -36,23 +36,27 @@ from pathlib import Path
 import torch
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from .batcher import DynamicBatcher
 from .config import (
     ATTN_IMPL,
     BATCH_TIMEOUT_MS,
     CROSSFADE_MS,
+    BIND_PORT,
     DEFAULT_LANGUAGE,
     DEFAULT_VOICE,
     DEVICE,
     FIRST_CHUNK_GUIDANCE,
     FIRST_CHUNK_STEPS,
+    FORWARDED_ALLOW_IPS,
     MAX_BATCH_SIZE,
     MAX_CONCURRENT,
     MAX_WORKERS,
     MODEL_ID,
     MODEL_TYPE,
     SORT_BATCH,
+    TRUST_PROXY_HEADERS,
     USE_CUDNN_BENCH,
     USE_SAGE_ATTN,
     USE_TF32,
@@ -251,7 +255,7 @@ async def lifespan(app: FastAPI):
     # ------------------------------------------------------------------
     logger.info(
         "  Loading model + warming up in %d worker(s) — port %s will open AFTER this completes …",
-        MAX_WORKERS, "8000",
+        MAX_WORKERS, BIND_PORT,
     )
     t_warm = time.perf_counter()
     loop = asyncio.get_running_loop()
@@ -371,10 +375,20 @@ def create_app() -> FastAPI:
             "Modular OmniVoice TTS — ProcessPoolExecutor, DynamicBatcher, "
             "SageAttention, chunked-diffusion pipelined streaming, "
             "JSON-based voice profiles with cached numpy embeddings, "
-            "INT4 / INT8 / BF16 / FP16 / FP32 weight quantization."
+            "INT4 / INT8 / BF16 / FP16 / FP32 weight quantization. "
+            "Designed to run behind nginx (see deploy/nginx.conf)."
         ),
         lifespan=lifespan,
     )
+    if TRUST_PROXY_HEADERS:
+        raw_trusted = FORWARDED_ALLOW_IPS.strip()
+        if raw_trusted == "*":
+            trusted_hosts: str | list[str] = "*"
+        else:
+            trusted_hosts = [
+                h.strip() for h in raw_trusted.split(",") if h.strip()
+            ] or ["127.0.0.1"]
+        app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=trusted_hosts)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

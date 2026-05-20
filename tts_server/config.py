@@ -29,6 +29,19 @@ import os
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
+# HTTP bind / reverse proxy (nginx)
+# ---------------------------------------------------------------------------
+# Uvicorn listen address.  Default 127.0.0.1 — expose only via nginx on :80/:443.
+# Set HOST=0.0.0.0 for direct LAN access without a reverse proxy.
+BIND_HOST: str = os.getenv("HOST", os.getenv("OMNIVOICE_BIND_HOST", "127.0.0.1")).strip()
+BIND_PORT: int = int(os.getenv("PORT", "8000"))
+
+# Trust X-Forwarded-* from nginx (set OMNIVOICE_TRUST_PROXY=0 to disable).
+TRUST_PROXY_HEADERS: bool = os.getenv("OMNIVOICE_TRUST_PROXY", "1") == "1"
+# Comma-separated IPs/CIDRs nginx may connect from; ``*`` trusts any (typical on same host).
+FORWARDED_ALLOW_IPS: str = os.getenv("OMNIVOICE_FORWARDED_ALLOW_IPS", "127.0.0.1,::1")
+
+# ---------------------------------------------------------------------------
 # Model / device
 # ---------------------------------------------------------------------------
 MODEL_ID:    str        = os.getenv("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")

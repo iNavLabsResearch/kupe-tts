@@ -380,7 +380,7 @@
     <h2>Configuration</h2>
     <div class="form-grid">
       <label class="text-row">API base URL (HTTP or HTTPS — REST + WebSocket derived from this)
-        <input id="apiBase" type="text" placeholder="http://localhost:8000" spellcheck="false" autocomplete="off" />
+        <input id="apiBase" type="text" placeholder="http://localhost" spellcheck="false" autocomplete="off" />
       </label>
       <label>WebSocket URL (auto-filled; edit if you use a separate WS host)
         <input id="url" spellcheck="false" autocomplete="off" />
@@ -720,28 +720,8 @@ const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, c => (
 const LS_API_BASE = 'omnivoice_demo_api_base';
 const LS_WS_URL   = 'omnivoice_demo_ws_url';
 
-/** ngrok free / dev tunnels often return an HTML interstitial unless this header is sent. */
-function tunnelBrowserFetchHeaders() {
-  return {
-    'ngrok-skip-browser-warning': 'true',
-    'Accept': 'application/json',
-  };
-}
-
-/** WebSocket API cannot set custom headers; ngrok accepts the same flag as a query param. */
-function withTunnelWsQuery(wsUrl) {
-  try {
-    const u = new URL(wsUrl);
-    const h = u.hostname.toLowerCase();
-    if (
-      h.includes('ngrok-free.app') || h.includes('ngrok.io') ||
-      h.endsWith('loca.lt') || h.includes('localhost.run')
-    ) {
-      u.searchParams.set('ngrok-skip-browser-warning', 'true');
-      return u.toString();
-    }
-  } catch (_) { /* ignore */ }
-  return wsUrl;
+function apiFetchHeaders() {
+  return { Accept: 'application/json' };
 }
 
 /** Reject truncated / broken saved WebSocket URLs (e.g. missing host path). */
@@ -765,7 +745,7 @@ function apiBaseTrim() {
 /** Build default ws(s)://host/ws/tts from http(s) API origin. */
 function originToDefaultWs(origin) {
   let o = (origin || '').trim().replace(/\/$/, '');
-  if (!o) o = 'http://localhost:8000';
+  if (!o) o = 'http://localhost';
   // IMPORTANT: replace https before http — otherwise /^http:/ matches the "http" prefix of "https:".
   const ws = o.replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:');
   return ws + (/\/ws\/tts$/i.test(ws) ? '' : '/ws/tts');
@@ -806,7 +786,7 @@ async function fetchVoicesJson() {
   const url = base + '/api/voices';
   const r = await fetch(url, {
     cache: 'no-store',
-    headers: tunnelBrowserFetchHeaders(),
+    headers: apiFetchHeaders(),
   });
   const ct = (r.headers.get('content-type') || '').toLowerCase();
   if (!r.ok) {
@@ -817,7 +797,7 @@ async function fetchVoicesJson() {
     const t = await r.text();
     throw new Error(
       `Expected JSON from /api/voices, got ${ct || 'unknown'} ` +
-      `(tunnel HTML? try ngrok header). Body: ${t.slice(0, 120).replace(/\s+/g, ' ')}…`
+      `Body: ${t.slice(0, 120).replace(/\s+/g, ' ')}…`
     );
   }
   const j = await r.json();
@@ -905,7 +885,7 @@ async function loadVoiceForEdit(name) {
     const base = apiBaseTrim();
     const r = await fetch(base + '/api/voices/' + encodeURIComponent(name), {
       cache: 'no-store',
-      headers: tunnelBrowserFetchHeaders(),
+      headers: apiFetchHeaders(),
     });
     const ct = (r.headers.get('content-type') || '').toLowerCase();
     const txt = await r.text();
@@ -972,7 +952,7 @@ async function saveVoiceEdit() {
     const base = apiBaseTrim();
     const r = await fetch(base + '/api/voices/' + encodeURIComponent(orig), {
       method: 'PUT',
-      headers: { 'ngrok-skip-browser-warning': 'true' },
+      headers: apiFetchHeaders(),
       body: fd,
     });
     const txt = await r.text();
@@ -1011,7 +991,7 @@ async function deleteVoiceProfile(name) {
     const base = apiBaseTrim();
     const r = await fetch(base + '/api/voices/' + encodeURIComponent(name), {
       method: 'DELETE',
-      headers: tunnelBrowserFetchHeaders(),
+      headers: apiFetchHeaders(),
     });
     const txt = await r.text();
     let j = null;
@@ -1074,7 +1054,7 @@ async function createPersona() {
   try {
     const r = await fetch(base + '/api/voices', {
       method: 'POST',
-      headers: { 'ngrok-skip-browser-warning': 'true' },
+      headers: apiFetchHeaders(),
       body: fd,
     });
     const txt = await r.text();
@@ -1551,7 +1531,7 @@ async function playWavArrayBuffer(wavAb) {
  * Stream runner
  * ==================================================================== */
 function runStream(streamId, params, onComplete) {
-  const wsUrl = withTunnelWsQuery(params.url);
+  const wsUrl = params.url;
   const ws    = new WebSocket(wsUrl);
   const state = {
     tSend: 0, firstAt: 0, chunks: 0, audioMs: 0, ws,
@@ -1862,7 +1842,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
   const savedBase = localStorage.getItem(LS_API_BASE);
   const savedWs = localStorage.getItem(LS_WS_URL);
-  $('apiBase').value = (savedBase && savedBase.trim()) ? savedBase.trim() : 'http://localhost:8000';
+  $('apiBase').value = (savedBase && savedBase.trim()) ? savedBase.trim() : 'http://localhost';
   if (savedWs && websocketUrlLooksComplete(savedWs)) $('url').value = savedWs.trim();
   else syncWsFromApiBase();
 
@@ -1904,7 +1884,7 @@ window.addEventListener('DOMContentLoaded', () => {
       const base = apiBaseTrim();
       const r = await fetch(base + '/health', {
         cache: 'no-store',
-        headers: tunnelBrowserFetchHeaders(),
+        headers: apiFetchHeaders(),
       });
       if (r.ok) {
         const j = await r.json();

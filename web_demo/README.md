@@ -14,16 +14,22 @@ plays the audio of one chosen stream so you can hear that everything works.
 
 ## How to run
 
-1. Start the OmniVoice server on `localhost:8000`:
+1. Start the OmniVoice server (binds to `127.0.0.1:8000` by default):
    ```bash
    python server.py
    ```
-2. Serve this folder over HTTP (so the UI can fetch `sample_text.txt`):
+2. Enable nginx (serves the API and this UI under `/demo/`):
    ```bash
-   cd web_demo
-   python -m http.server 5500
+   sudo cp deploy/nginx.conf /etc/nginx/sites-available/omnivoice
+   # Edit `server_name` and the `alias` path for `web_demo/` in that file.
+   sudo ln -sf /etc/nginx/sites-available/omnivoice /etc/nginx/sites-enabled/
+   sudo nginx -t && sudo systemctl reload nginx
    ```
-3. Open <http://localhost:5500/concurrent_streams.html> in your browser.
+3. Open <http://localhost/demo/concurrent_streams.html> and set **API base** to
+   `http://localhost` (WebSocket URL becomes `ws://localhost/ws/tts`).
+
+**Without nginx:** use `HOST=0.0.0.0 python server.py`, serve this folder with
+`python -m http.server 5500`, and point the UI at `http://localhost:8000`.
 
 Opening the file directly via `file://` also works — the multilingual sample
 text is embedded as a fallback if `fetch('./sample_text.txt')` fails.

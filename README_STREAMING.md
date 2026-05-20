@@ -51,20 +51,38 @@ pip install -r requirements_server.txt
 
 ### 2. Start the server
 
+**Production (nginx on port 80, app on localhost:8000):**
+
 ```bash
 python server.py
+sudo cp deploy/nginx.conf /etc/nginx/sites-available/omnivoice
+# Edit server_name and web_demo path in the config, then:
+sudo ln -sf /etc/nginx/sites-available/omnivoice /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Clients connect to `ws://<your-host>/ws/tts` and `http://<your-host>/health` through nginx.
+
+**Local dev without nginx** (bind on all interfaces):
+
+```bash
+HOST=0.0.0.0 python server.py
 ```
 
 The server will:
 1. Download `k2-fsa/OmniVoice` from HuggingFace (first run)
-2. Pre-tokenise `voice_reference/man_voice.mp3` as the default voice
+2. Pre-tokenise voice profiles from `voice_reference/`
 3. Run a pre-warmup inference
-4. Start listening on `ws://0.0.0.0:8000/ws/tts`
+4. Listen on `127.0.0.1:8000` by default (or `0.0.0.0` when `HOST=0.0.0.0`)
 
 **Environment variables** (all optional):
 
 | Variable | Default | Description |
 |---|---|---|
+| `HOST` | `127.0.0.1` | Uvicorn bind address (`0.0.0.0` for direct access) |
+| `PORT` | `8000` | Uvicorn port (nginx upstream must match) |
+| `OMNIVOICE_TRUST_PROXY` | `1` | Honor `X-Forwarded-*` from nginx |
+| `OMNIVOICE_FORWARDED_ALLOW_IPS` | `127.0.0.1,::1` | Trusted proxy IPs for forwarded headers |
 | `OMNIVOICE_MODEL` | `k2-fsa/OmniVoice` | HuggingFace model ID or local path |
 | `OMNIVOICE_DEVICE` | auto | `cuda`, `mps`, or `cpu` |
 | `CHUNK_CHARS` | `60` | Sentence chunk size in characters |
@@ -163,8 +181,12 @@ audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 ## Health Check
 
 ```bash
-curl http://localhost:8000/health
-# {"status":"ok","model":"k2-fsa/OmniVoice","sample_rate":24000,"device":"cuda:0","voice_prompt_ready":true}
+# Through nginx
+curl http://localhost/health
+
+# Direct to uvicorn (bypass nginx)
+curl http://127.0.0.1:8000/health
+# {"status":"ok","model":"k2-fsa/OmniVoice","sample_rate":24000,"device":"cuda:0",...}
 ```
 
 ---
