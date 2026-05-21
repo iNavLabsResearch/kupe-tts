@@ -382,6 +382,10 @@
       <label class="text-row">API base URL (HTTP or HTTPS — REST + WebSocket derived from this)
         <input id="apiBase" type="text" placeholder="http://localhost" spellcheck="false" autocomplete="off" />
       </label>
+      <label class="text-row" title="Same value as OMNIVOICE_API_KEY in server .env. Sent as Authorization: Bearer and on WebSocket as ?api_key=">
+        API key
+        <input id="apiKey" type="password" placeholder="OMNIVOICE_API_KEY from .env" spellcheck="false" autocomplete="off" />
+      </label>
       <label>WebSocket URL (auto-filled; edit if you use a separate WS host)
         <input id="url" spellcheck="false" autocomplete="off" />
       </label>
@@ -719,9 +723,36 @@ const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, c => (
 
 const LS_API_BASE = 'omnivoice_demo_api_base';
 const LS_WS_URL   = 'omnivoice_demo_ws_url';
+const LS_API_KEY  = 'omnivoice_demo_api_key';
 
-function apiFetchHeaders() {
-  return { Accept: 'application/json' };
+function apiKeyTrim() {
+  const el = $('apiKey');
+  return el ? (el.value || '').trim() : '';
+}
+
+function apiFetchHeaders(extra) {
+  const h = { Accept: 'application/json', ...(extra || {}) };
+  const key = apiKeyTrim();
+  if (key) {
+    h.Authorization = 'Bearer ' + key;
+    h['x-api-key'] = key;
+  }
+  return h;
+}
+
+/** Browsers cannot set Authorization on WebSocket — append ?api_key= for auth middleware. */
+function websocketUrlWithAuth(rawUrl) {
+  const key = apiKeyTrim();
+  const url = (rawUrl || '').trim();
+  if (!key || !url) return url;
+  try {
+    const u = new URL(url);
+    u.searchParams.set('api_key', key);
+    return u.toString();
+  } catch {
+    const sep = url.includes('?') ? '&' : '?';
+    return url + sep + 'api_key=' + encodeURIComponent(key);
+  }
 }
 
 /** Reject truncated / broken saved WebSocket URLs (e.g. missing host path). */
@@ -759,6 +790,7 @@ function saveApiPrefs() {
   try {
     localStorage.setItem(LS_API_BASE, apiBaseTrim());
     localStorage.setItem(LS_WS_URL, ($('url').value || '').trim());
+    localStorage.setItem(LS_API_KEY, apiKeyTrim());
   } catch (_) {}
 }
 
@@ -1531,7 +1563,7 @@ async function playWavArrayBuffer(wavAb) {
  * Stream runner
  * ==================================================================== */
 function runStream(streamId, params, onComplete) {
-  const wsUrl = params.url;
+  const wsUrl = websocketUrlWithAuth(params.url);
   const ws    = new WebSocket(wsUrl);
   const state = {
     tSend: 0, firstAt: 0, chunks: 0, audioMs: 0, ws,
@@ -1854,7 +1886,9 @@ window.addEventListener('DOMContentLoaded', () => {
 
   const savedBase = localStorage.getItem(LS_API_BASE);
   const savedWs = localStorage.getItem(LS_WS_URL);
+  const savedKey = localStorage.getItem(LS_API_KEY);
   $('apiBase').value = (savedBase && savedBase.trim()) ? savedBase.trim() : 'http://localhost';
+  if ($('apiKey') && savedKey) $('apiKey').value = savedKey;
   if (savedWs && websocketUrlLooksComplete(savedWs)) $('url').value = savedWs.trim();
   else syncWsFromApiBase();
 
@@ -1865,6 +1899,13 @@ window.addEventListener('DOMContentLoaded', () => {
     if ($('tabVoices') && $('tabVoices').classList.contains('active')) refreshVoiceManagementTable();
   });
   $('url').addEventListener('change', saveApiPrefs);
+  if ($('apiKey')) {
+    $('apiKey').addEventListener('change', () => {
+      saveApiPrefs();
+      refreshVoiceList();
+      if ($('tabVoices') && $('tabVoices').classList.contains('active')) refreshVoiceManagementTable();
+    });
+  }
   $('refreshVoices').addEventListener('click', () => { saveApiPrefs(); refreshVoiceList(); });
   $('createVoice').addEventListener('click', createPersona);
 
