@@ -14,9 +14,12 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from .core.container import AppContainer
 from .core.settings import load_settings
 from .config import (
+    API_KEYS,
+    AUTH_PUBLIC_PATHS,
     TRUST_PROXY_HEADERS,
     FORWARDED_ALLOW_IPS,
 )
+from .middleware import APIKeyAuthMiddleware
 from .routes import batch_router, health_router, openai_speech_router, streaming_router, voices_router
 from .services.synthesis import DefaultSynthesisService
 from .services.voice import DefaultVoiceService
@@ -66,6 +69,11 @@ def create_app() -> FastAPI:
         allow_origins=["*"],
         allow_methods=["*"],
         allow_headers=["*"],
+    )
+    app.add_middleware(
+        APIKeyAuthMiddleware,
+        api_keys=API_KEYS,
+        public_paths=AUTH_PUBLIC_PATHS,
     )
     app.include_router(health_router)
     app.include_router(batch_router)

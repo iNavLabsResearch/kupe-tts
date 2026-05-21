@@ -25,8 +25,25 @@ setting.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# .env — load before reading OMNIVOICE_* / API key variables
+# ---------------------------------------------------------------------------
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_ENV_FILE = _PROJECT_ROOT / ".env"
+
+try:
+    from dotenv import load_dotenv
+
+    if _ENV_FILE.is_file():
+        load_dotenv(_ENV_FILE, override=False)
+except ImportError:
+    pass
+
+_logger = logging.getLogger("omnivoice.config")
 
 # ---------------------------------------------------------------------------
 # HTTP bind / reverse proxy (nginx)
@@ -293,3 +310,52 @@ def cfg_with_epochs(base: dict, epochs: int | None) -> dict:
     if epochs is not None:
         cfg["num_step"] = max(EPOCHS_MIN, min(EPOCHS_MAX, int(epochs)))
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# API key auth (``.env`` → ``OMNIVOICE_API_KEY`` or ``TTS_API_KEY``)
+# ---------------------------------------------------------------------------
+def _parse_api_keys(raw: str) -> frozenset[str]:
+    keys: set[str] = set()
+    for part in raw.split(","):
+        key = part.strip()
+        if key:
+            keys.add(key)
+    return frozenset(keys)
+
+
+def _load_api_keys() -> frozenset[str]:
+    raw = (
+        os.getenv("OMNIVOICE_API_KEY", "").strip()
+        or os.getenv("TTS_API_KEY", "").strip()
+        or os.getenv("OPENAI_API_KEY", "").strip()
+    )
+    if not raw:
+        return frozenset()
+    return _parse_api_keys(raw)
+
+
+API_KEYS: frozenset[str] = _load_api_keys()
+API_AUTH_ENABLED: bool = bool(API_KEYS)
+
+_raw_public = os.getenv(
+    "OMNIVOICE_AUTH_PUBLIC_PATHS",
+    "/health,/docs,/openapi.json,/redoc",
+).strip()
+AUTH_PUBLIC_PATHS: frozenset[str] = frozenset(
+    p.strip() for p in _raw_public.split(",") if p.strip()
+)
+
+if API_AUTH_ENABLED:
+    _logger.info(
+        "API key auth enabled (%d key(s)); public paths: %s",
+        len(API_KEYS),
+        sorted(AUTH_PUBLIC_PATHS),
+    )
+elif _ENV_FILE.is_file() and not os.getenv("OMNIVOICE_API_KEY"):
+    _logger.warning(
+        "API key auth disabled — set OMNIVOICE_API_KEY in %s to require auth",
+        _ENV_FILE,
+    )
+else:
+    _logger.info("API key auth disabled (OMNIVOICE_API_KEY not set)")
