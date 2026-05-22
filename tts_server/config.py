@@ -192,6 +192,11 @@ MAX_BATCH_SIZE:   int   = max(1, int(os.getenv("OMNIVOICE_MAX_BATCH_SIZE",      
 BATCH_TIMEOUT_MS: float = max(0.0, float(os.getenv("OMNIVOICE_BATCH_TIMEOUT_MS", "50")))
 MAX_CONCURRENT:   int   = max(1, int(os.getenv("OMNIVOICE_MAX_CONCURRENT",        "16")))
 
+# WebSocket keepalive (uvicorn ws_ping_* in server.py)
+WS_KEEPALIVE: bool = os.getenv("OMNIVOICE_WS_KEEPALIVE", "1") == "1"
+WS_PING_INTERVAL: float = max(1.0, float(os.getenv("OMNIVOICE_WS_PING_INTERVAL", "20")))
+WS_PING_TIMEOUT: float = max(5.0, float(os.getenv("OMNIVOICE_IDLE_TIMEOUT", "300")))
+
 # First-chunk priority batching — collection window for batching concurrent
 # first-chunk requests together.  Short enough to not hurt single-stream FCL,
 # long enough to catch burst arrivals from concurrent WebSocket connections.
