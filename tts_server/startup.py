@@ -35,6 +35,9 @@ from .config import (
     MAX_BATCH_SIZE,
     MAX_CONCURRENT,
     MAX_WORKERS,
+    WS_PING_INTERVAL,
+    WS_PING_TIMEOUT,
+    WS_PROTOCOL_PING,
     MODEL_ID,
     MODEL_TYPE,
     SORT_BATCH,
@@ -105,6 +108,17 @@ async def lifespan(app: FastAPI):
     logger.info("  max_batch_size      : %d", MAX_BATCH_SIZE)
     logger.info("  batch_timeout       : %.0f ms", BATCH_TIMEOUT_MS)
     logger.info("  max_concurrent      : %d", MAX_CONCURRENT)
+    logger.info(
+        "  ws_protocol_ping    : %s  (interval=%s  timeout=%s)",
+        WS_PROTOCOL_PING,
+        WS_PING_INTERVAL if WS_PING_INTERVAL is not None else "off",
+        WS_PING_TIMEOUT if WS_PING_TIMEOUT is not None else "off",
+    )
+    if not WS_PROTOCOL_PING:
+        logger.info(
+            "  ws_note             : launch via `python server.py` — handler keeps "
+            "connections open; use app-level {\"type\":\"ping\"} between requests"
+        )
     logger.info("  attn_impl           : %s", ATTN_IMPL)
     logger.info("  sage_attn           : %s", USE_SAGE_ATTN)
     logger.info("  torch.compile       : %s", USE_TORCH_COMPILE)

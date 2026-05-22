@@ -143,8 +143,30 @@ You > Hello, how are you doing today? I hope everything is going well.
 ```
 
 Keep the WebSocket open and read messages until you receive **`response.audio.done`**
-(do not close after the first `response.audio.delta`). Each delta includes
-`total_chunks` so you know how many audio messages to expect.
+(do not close after the first `response.audio.delta`). **Send the next
+`tts.request` on the same socket** — do not open a new connection per utterance.
+Each delta includes `total_chunks` so you know how many audio messages to expect.
+
+**Server logs** (one TCP connection, many requests):
+
+```
+WS connected  session=a1b2c3d4  ...
+WS TTS request  session=a1b2c3d4  req=1  ...
+Done.  session=a1b2c3d4  req=1  ...
+WS session=a1b2c3d4  req=1  complete — connection stays open for next tts.request
+WS TTS request  session=a1b2c3d4  req=2  ...    ← same session id, no second "connected"
+```
+
+**Verify persistence:**
+
+```bash
+python scripts/test_ws_persistent.py --url ws://localhost:8000/ws/tts --requests 3
+```
+
+**Launch correctly:** use `python server.py`, not bare `uvicorn server:app` (bare
+uvicorn uses a 20s WebSocket ping timeout and can drop idle/busy clients). Set
+`OMNIVOICE_WS_PROTOCOL_PING=0` in `.env` unless your client answers RFC6455 pongs
+during synthesis.
 
 **Done signal** (sent after all chunks):
 ```json

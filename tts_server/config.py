@@ -192,10 +192,23 @@ MAX_BATCH_SIZE:   int   = max(1, int(os.getenv("OMNIVOICE_MAX_BATCH_SIZE",      
 BATCH_TIMEOUT_MS: float = max(0.0, float(os.getenv("OMNIVOICE_BATCH_TIMEOUT_MS", "50")))
 MAX_CONCURRENT:   int   = max(1, int(os.getenv("OMNIVOICE_MAX_CONCURRENT",        "16")))
 
-# WebSocket keepalive (uvicorn ws_ping_* in server.py)
+# WebSocket persistence (see server.py — must launch via ``python server.py``)
+# App-level ping: client sends ``{"type":"ping"}`` → ``pong`` (always supported).
 WS_KEEPALIVE: bool = os.getenv("OMNIVOICE_WS_KEEPALIVE", "1") == "1"
-WS_PING_INTERVAL: float = max(1.0, float(os.getenv("OMNIVOICE_WS_PING_INTERVAL", "20")))
-WS_PING_TIMEOUT: float = max(5.0, float(os.getenv("OMNIVOICE_IDLE_TIMEOUT", "300")))
+# Uvicorn *protocol* pings (RFC6455). Off by default: many clients do not answer
+# pongs while blocked on synthesis, which looks like the server closing after
+# ``response.audio.done``. Enable only if your client handles protocol pongs.
+WS_PROTOCOL_PING: bool = os.getenv("OMNIVOICE_WS_PROTOCOL_PING", "0") == "1"
+WS_PING_INTERVAL: float | None = (
+    max(1.0, float(os.getenv("OMNIVOICE_WS_PING_INTERVAL", "60")))
+    if WS_KEEPALIVE and WS_PROTOCOL_PING
+    else None
+)
+WS_PING_TIMEOUT: float | None = (
+    max(5.0, float(os.getenv("OMNIVOICE_IDLE_TIMEOUT", "300")))
+    if WS_KEEPALIVE and WS_PROTOCOL_PING
+    else None
+)
 
 # First-chunk priority batching — collection window for batching concurrent
 # first-chunk requests together.  Short enough to not hurt single-stream FCL,

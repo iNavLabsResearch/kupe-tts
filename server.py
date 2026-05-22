@@ -16,7 +16,6 @@ from tts_server.config import (
     BIND_PORT,
     FORWARDED_ALLOW_IPS,
     TRUST_PROXY_HEADERS,
-    WS_KEEPALIVE,
     WS_PING_INTERVAL,
     WS_PING_TIMEOUT,
 )
@@ -32,8 +31,8 @@ if __name__ == "__main__":
         host=BIND_HOST,
         port=BIND_PORT,
         log_level="info",
-        ws_ping_interval=WS_PING_INTERVAL if WS_KEEPALIVE else None,
-        ws_ping_timeout=WS_PING_TIMEOUT if WS_KEEPALIVE else None,
+        ws_ping_interval=WS_PING_INTERVAL,
+        ws_ping_timeout=WS_PING_TIMEOUT,
         proxy_headers=TRUST_PROXY_HEADERS,
         forwarded_allow_ips=FORWARDED_ALLOW_IPS,
     )

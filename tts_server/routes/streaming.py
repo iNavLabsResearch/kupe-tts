@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import struct
 import time
 from typing import Optional
@@ -88,7 +89,13 @@ def _np_to_pcm16_bytes(audio: np.ndarray) -> bytes:
 @router.websocket("/ws/tts")
 async def ws_tts(websocket: WebSocket):
     await websocket.accept()
-    logger.info("WS connected: %s", websocket.client)
+    session_id = secrets.token_hex(4)
+    request_num = 0
+    logger.info(
+        "WS connected  session=%s  client=%s  (persistent — no close after audio.done)",
+        session_id,
+        websocket.client,
+    )
     batcher = websocket.app.state.batcher
     sample_rate: int = getattr(websocket.app.state, "sample_rate", 24_000)
     default_voice: str = getattr(websocket.app.state, "default_voice", "")
@@ -101,8 +108,14 @@ async def ws_tts(websocket: WebSocket):
             try:
                 msg = await websocket.receive_json()
             except WebSocketDisconnect:
+                logger.info(
+                    "WS disconnected while waiting  session=%s  requests_completed=%d",
+                    session_id,
+                    request_num,
+                )
                 break
 
+            request_num += 1
             mt = msg.get("type", "")
             if mt == "ping":
                 await websocket.send_json({"type": "pong"})
@@ -173,7 +186,10 @@ async def ws_tts(websocket: WebSocket):
             fc_cfg = cfg_with_epochs(FIRST_CHUNK_CFG, epochs_fc)
 
             logger.info(
-                "WS TTS request  voice=%s  lang=%s  speed=%s  model=%s  epochs_fc=%s  epochs_rest=%s  text=%.80s",
+                "WS TTS request  session=%s  req=%d  voice=%s  lang=%s  speed=%s  model=%s  "
+                "epochs_fc=%s  epochs_rest=%s  text=%.80s",
+                session_id,
+                request_num,
                 voice, language or "auto",
                 f"{speed:.2f}" if speed is not None else "default",
                 model_type,
@@ -452,16 +468,28 @@ async def ws_tts(websocket: WebSocket):
                 "epochs_rest_chunk":      epochs_rest_done,
             })
             logger.info(
-                "Done.  chunks=%d  audio=%dms  wall=%.0fms  first_chunk=%.0fms  "
-                "voice=%s  lang=%s  speed=%s  epochs_fc=%d  epochs_rest=%d",
+                "Done.  session=%s  req=%d  chunks=%d  audio=%dms  wall=%.0fms  "
+                "first_chunk=%.0fms  voice=%s  lang=%s  speed=%s  epochs_fc=%d  epochs_rest=%d",
+                session_id,
+                request_num,
                 n, total_audio_ms, total_wall_ms, first_latency_ms or 0,
                 voice, language or "auto",
                 f"{speed:.2f}" if speed is not None else "default",
                 epochs_first, epochs_rest_done,
             )
+            logger.info(
+                "WS session=%s  req=%d  complete — connection stays open for next tts.request",
+                session_id,
+                request_num,
+            )
 
     except WebSocketDisconnect:
-        logger.info("WS disconnected: %s", websocket.client)
+        logger.info(
+            "WS disconnected  session=%s  requests_completed=%d  client=%s",
+            session_id,
+            request_num,
+            websocket.client,
+        )
     except Exception as exc:
         logger.exception("WS error: %s", exc)
         try:
@@ -469,4 +497,9 @@ async def ws_tts(websocket: WebSocket):
         except Exception:
             pass
     finally:
-        logger.info("WS closed: %s", websocket.client)
+        logger.info(
+            "WS handler exit  session=%s  requests_completed=%d  client=%s",
+            session_id,
+            request_num,
+            websocket.client,
+        )
