@@ -38,6 +38,19 @@ _SHORTCUT_TO_ID = {
     # Indic
     "pu": "pa",   # common typo for Punjabi (pa)
     "punjabi": "pa",
+    # Base language codes (fallback if LANG_IDS import fails or BCP-47 parsing)
+    "hi": "hi",
+    "bn": "bn",
+    "ta": "ta",
+    "te": "te",
+    "gu": "gu",
+    "kn": "kn",
+    "ml": "ml",
+    "mr": "mr",
+    "pa": "pa",
+    "od": "ory",
+    "or": "ory",
+    "en": "en",
     # Hindi/Urdu romanisations
     "hin": "hi",
     "guj": "gu",
