@@ -84,6 +84,13 @@ def resolve_language(value: Optional[str]) -> Optional[str]:
     low = s.lower()
     if low in _AUTO_TOKENS:
         return None
+    # BCP-47 locales (e.g. en-IN, hi-IN) → base ISO 639-3 code
+    if "-" in low:
+        base, _region = low.split("-", 1)
+        if base in LANG_IDS:
+            return base
+        if base in _SHORTCUT_TO_ID:
+            return _SHORTCUT_TO_ID[base]
     # Direct ISO code match
     if low in LANG_IDS:
         return low
