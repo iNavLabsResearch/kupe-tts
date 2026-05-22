@@ -102,6 +102,10 @@ class APIKeyAuthMiddleware:
             await response(scope, receive, send)
             return
 
+        # Must accept the WebSocket before closing per ASGI protocol so the
+        # client receives a clean close frame with code 1008, rather than a
+        # confusing connection rejection / protocol error.
+        await send({"type": "websocket.accept"})
         await send({"type": "websocket.close", "code": 1008, "reason": "invalid_api_key"})
         while True:
             message = await receive()
