@@ -9,7 +9,7 @@ Each WebSocket message is a JSON object::
       "voice":    "ajay",           // optional — any profile known to the server (incl. hot-added)
       "epochs":   16,                // optional — sets BOTH first- and rest-chunk steps when the
                                      // specific keys below are omitted (alias: inference_steps)
-      "epochs_fc":   4,             // optional — first-chunk num_step only (aliases: first_chunk_epochs)
+      "epochs_fc":   8,             // optional — first-chunk num_step only (aliases: first_chunk_epochs)
       "epochs_rest": 12,            // optional — mid + last chunk num_step (aliases: rest_chunk_epochs)
       "digit_words_lang": "hi",     // optional — legacy; prefer digit_pronunciation
       "digit_words_hint": "hinglish",  // optional — English digits in Indic/SEA text

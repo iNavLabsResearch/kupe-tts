@@ -256,7 +256,7 @@ CROSSFADE_MS: int = max(0, int(os.getenv("OMNIVOICE_CROSSFADE_MS", "80")))
 # ---------------------------------------------------------------------------
 # First-chunk latency optimisation
 # ---------------------------------------------------------------------------
-FIRST_CHUNK_STEPS:    int   = max(1, int(os.getenv("OMNIVOICE_FIRST_CHUNK_STEPS", "4")))
+FIRST_CHUNK_STEPS:    int   = max(1, int(os.getenv("OMNIVOICE_FIRST_CHUNK_STEPS", "8")))
 FIRST_CHUNK_GUIDANCE: float = float(os.getenv("OMNIVOICE_FIRST_CHUNK_GUIDANCE", "1.0"))
 
 # Rest-chunk (mid + last) diffusion steps.  Lower → faster GPU calls → lower
