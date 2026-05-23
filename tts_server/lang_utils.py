@@ -38,6 +38,19 @@ _SHORTCUT_TO_ID = {
     # Indic
     "pu": "pa",   # common typo for Punjabi (pa)
     "punjabi": "pa",
+    # Base language codes (fallback if LANG_IDS import fails or BCP-47 parsing)
+    "hi": "hi",
+    "bn": "bn",
+    "ta": "ta",
+    "te": "te",
+    "gu": "gu",
+    "kn": "kn",
+    "ml": "ml",
+    "mr": "mr",
+    "pa": "pa",
+    "od": "ory",
+    "or": "ory",
+    "en": "en",
     # Hindi/Urdu romanisations
     "hin": "hi",
     "guj": "gu",
@@ -84,6 +97,13 @@ def resolve_language(value: Optional[str]) -> Optional[str]:
     low = s.lower()
     if low in _AUTO_TOKENS:
         return None
+    # BCP-47 locales (e.g. en-IN, hi-IN) → base ISO 639-3 code
+    if "-" in low:
+        base, _region = low.split("-", 1)
+        if base in LANG_IDS:
+            return base
+        if base in _SHORTCUT_TO_ID:
+            return _SHORTCUT_TO_ID[base]
     # Direct ISO code match
     if low in LANG_IDS:
         return low

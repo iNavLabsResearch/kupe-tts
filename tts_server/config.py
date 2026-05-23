@@ -25,14 +25,54 @@ setting.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# .env — load before reading OMNIVOICE_* / API key variables
+# ---------------------------------------------------------------------------
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_ENV_FILE = _PROJECT_ROOT / ".env"
+
+try:
+    from dotenv import load_dotenv
+
+    if _ENV_FILE.is_file():
+        load_dotenv(_ENV_FILE, override=False)
+except ImportError:
+    pass
+
+_logger = logging.getLogger("omnivoice.config")
+
+# ---------------------------------------------------------------------------
+# HTTP bind / reverse proxy (nginx)
+# ---------------------------------------------------------------------------
+# Uvicorn listen address.  Default 127.0.0.1 — expose only via nginx on :80/:443.
+# Set HOST=0.0.0.0 for direct LAN access without a reverse proxy.
+BIND_HOST: str = os.getenv("HOST", os.getenv("OMNIVOICE_BIND_HOST", "127.0.0.1")).strip()
+BIND_PORT: int = int(os.getenv("PORT", "8000"))
+
+# Trust X-Forwarded-* from nginx (set OMNIVOICE_TRUST_PROXY=0 to disable).
+TRUST_PROXY_HEADERS: bool = os.getenv("OMNIVOICE_TRUST_PROXY", "1") == "1"
+# Comma-separated IPs/CIDRs nginx may connect from; ``*`` trusts any (typical on same host).
+FORWARDED_ALLOW_IPS: str = os.getenv("OMNIVOICE_FORWARDED_ALLOW_IPS", "127.0.0.1,::1")
 
 # ---------------------------------------------------------------------------
 # Model / device
 # ---------------------------------------------------------------------------
 MODEL_ID:    str        = os.getenv("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")
 DEVICE:      str | None = os.getenv("OMNIVOICE_DEVICE", None)  # None → auto
+
+# Inference backend: "triton" (fast, default) or "standard" (original PyTorch).
+# "triton" requires `pip install omnivoice-triton`.
+_RAW_MODEL_TYPE = os.getenv("OMNIVOICE_MODEL_TYPE", "triton").strip().lower()
+if _RAW_MODEL_TYPE not in ("triton", "standard"):
+    raise ValueError(
+        f"OMNIVOICE_MODEL_TYPE='{_RAW_MODEL_TYPE}' is invalid. "
+        f"Accepted values: 'triton', 'standard'."
+    )
+MODEL_TYPE: str = _RAW_MODEL_TYPE
 
 # Weight dtype / quantization — alias map → canonical code (see docstring).
 _DTYPE_ALIASES: dict[str, str] = {
@@ -152,6 +192,24 @@ MAX_BATCH_SIZE:   int   = max(1, int(os.getenv("OMNIVOICE_MAX_BATCH_SIZE",      
 BATCH_TIMEOUT_MS: float = max(0.0, float(os.getenv("OMNIVOICE_BATCH_TIMEOUT_MS", "50")))
 MAX_CONCURRENT:   int   = max(1, int(os.getenv("OMNIVOICE_MAX_CONCURRENT",        "16")))
 
+# WebSocket persistence (see server.py — must launch via ``python server.py``)
+# App-level ping: client sends ``{"type":"ping"}`` → ``pong`` (always supported).
+WS_KEEPALIVE: bool = os.getenv("OMNIVOICE_WS_KEEPALIVE", "1") == "1"
+# Uvicorn *protocol* pings (RFC6455). Off by default: many clients do not answer
+# pongs while blocked on synthesis, which looks like the server closing after
+# ``response.audio.done``. Enable only if your client handles protocol pongs.
+WS_PROTOCOL_PING: bool = os.getenv("OMNIVOICE_WS_PROTOCOL_PING", "0") == "1"
+WS_PING_INTERVAL: float | None = (
+    max(1.0, float(os.getenv("OMNIVOICE_WS_PING_INTERVAL", "60")))
+    if WS_KEEPALIVE and WS_PROTOCOL_PING
+    else None
+)
+WS_PING_TIMEOUT: float | None = (
+    max(5.0, float(os.getenv("OMNIVOICE_IDLE_TIMEOUT", "300")))
+    if WS_KEEPALIVE and WS_PROTOCOL_PING
+    else None
+)
+
 # First-chunk priority batching — collection window for batching concurrent
 # first-chunk requests together.  Short enough to not hurt single-stream FCL,
 # long enough to catch burst arrivals from concurrent WebSocket connections.
@@ -176,6 +234,20 @@ USE_TORCH_COMPILE: bool = os.getenv("OMNIVOICE_COMPILE",     "1") == "1"
 SORT_BATCH:        bool = os.getenv("OMNIVOICE_SORT_BATCH",  "1") == "1"
 TORCH_COMPILE_MODE: str = os.getenv("OMNIVOICE_COMPILE_MODE", "reduce-overhead")
 
+# Synchronise CUDA before timing measurements.  Adds ~0.5-1 ms of stall but
+# gives precise GPU timing.  Disable in production for lower latency.
+SYNC_TIMING: bool = os.getenv("OMNIVOICE_SYNC_TIMING", "0") == "1"
+
+# Executor backend: "thread" (single-GPU, shared memory, lower overhead) or
+# "process" (multi-GPU safe, uses mp.spawn).  Default "thread" for single-GPU.
+_RAW_EXECUTOR_TYPE = os.getenv("OMNIVOICE_EXECUTOR", "thread").strip().lower()
+if _RAW_EXECUTOR_TYPE not in ("thread", "process"):
+    raise ValueError(
+        f"OMNIVOICE_EXECUTOR='{_RAW_EXECUTOR_TYPE}' is invalid. "
+        f"Accepted values: 'thread', 'process'."
+    )
+EXECUTOR_TYPE: str = _RAW_EXECUTOR_TYPE
+
 # ---------------------------------------------------------------------------
 # Streaming / crossfade
 # ---------------------------------------------------------------------------
@@ -184,13 +256,21 @@ CROSSFADE_MS: int = max(0, int(os.getenv("OMNIVOICE_CROSSFADE_MS", "80")))
 # ---------------------------------------------------------------------------
 # First-chunk latency optimisation
 # ---------------------------------------------------------------------------
-FIRST_CHUNK_STEPS:    int   = max(1, int(os.getenv("OMNIVOICE_FIRST_CHUNK_STEPS", "4")))
+FIRST_CHUNK_STEPS:    int   = max(1, int(os.getenv("OMNIVOICE_FIRST_CHUNK_STEPS", "8")))
 FIRST_CHUNK_GUIDANCE: float = float(os.getenv("OMNIVOICE_FIRST_CHUNK_GUIDANCE", "1.0"))
 
 # Rest-chunk (mid + last) diffusion steps.  Lower → faster GPU calls → lower
 # max FC latency when the GPU is busy with a rest-chunk.  Default 16 matches
 # a solid quality / speed trade-off; tune down (e.g. 8) for busier GPUs.
 REST_CHUNK_STEPS: int = max(1, int(os.getenv("OMNIVOICE_REST_CHUNK_STEPS", "16")))
+
+# Adaptive early exit: skip remaining diffusion steps when the fraction of
+# still-masked tokens drops below this value for ALL items in the batch.
+# 0.0 = disabled (always run all steps).  0.02 = exit when ≤2% tokens remain
+# masked, typically saving 1-3 forward passes with minimal quality impact.
+EARLY_EXIT_THRESHOLD: float = max(0.0, float(
+    os.getenv("OMNIVOICE_EARLY_EXIT", "0.0")
+))
 
 # ---------------------------------------------------------------------------
 # Generation config dicts (plain dicts for safe pickling across processes)
@@ -204,6 +284,7 @@ FIRST_CHUNK_CFG: dict = dict(
     layer_penalty_factor=5.0,
     position_temperature=5.0,
     class_temperature=0.0,
+    early_exit_threshold=EARLY_EXIT_THRESHOLD,
 )
 
 MID_CHUNK_CFG: dict = dict(
@@ -215,6 +296,7 @@ MID_CHUNK_CFG: dict = dict(
     layer_penalty_factor=5.0,
     position_temperature=5.0,
     class_temperature=0.0,
+    early_exit_threshold=EARLY_EXIT_THRESHOLD,
 )
 
 LAST_CHUNK_CFG: dict = dict(
@@ -226,6 +308,7 @@ LAST_CHUNK_CFG: dict = dict(
     layer_penalty_factor=5.0,
     position_temperature=5.0,
     class_temperature=0.0,
+    early_exit_threshold=EARLY_EXIT_THRESHOLD,
 )
 
 # ---------------------------------------------------------------------------
@@ -245,3 +328,52 @@ def cfg_with_epochs(base: dict, epochs: int | None) -> dict:
     if epochs is not None:
         cfg["num_step"] = max(EPOCHS_MIN, min(EPOCHS_MAX, int(epochs)))
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# API key auth (``.env`` → ``OMNIVOICE_API_KEY`` or ``TTS_API_KEY``)
+# ---------------------------------------------------------------------------
+def _parse_api_keys(raw: str) -> frozenset[str]:
+    keys: set[str] = set()
+    for part in raw.split(","):
+        key = part.strip()
+        if key:
+            keys.add(key)
+    return frozenset(keys)
+
+
+def _load_api_keys() -> frozenset[str]:
+    raw = (
+        os.getenv("OMNIVOICE_API_KEY", "").strip()
+        or os.getenv("TTS_API_KEY", "").strip()
+        or os.getenv("OPENAI_API_KEY", "").strip()
+    )
+    if not raw:
+        return frozenset()
+    return _parse_api_keys(raw)
+
+
+API_KEYS: frozenset[str] = _load_api_keys()
+API_AUTH_ENABLED: bool = bool(API_KEYS)
+
+_raw_public = os.getenv(
+    "OMNIVOICE_AUTH_PUBLIC_PATHS",
+    "/health,/docs,/openapi.json,/redoc",
+).strip()
+AUTH_PUBLIC_PATHS: frozenset[str] = frozenset(
+    p.strip() for p in _raw_public.split(",") if p.strip()
+)
+
+if API_AUTH_ENABLED:
+    _logger.info(
+        "API key auth enabled (%d key(s)); public paths: %s",
+        len(API_KEYS),
+        sorted(AUTH_PUBLIC_PATHS),
+    )
+elif _ENV_FILE.is_file() and not os.getenv("OMNIVOICE_API_KEY"):
+    _logger.warning(
+        "API key auth disabled — set OMNIVOICE_API_KEY in %s to require auth",
+        _ENV_FILE,
+    )
+else:
+    _logger.info("API key auth disabled (OMNIVOICE_API_KEY not set)")

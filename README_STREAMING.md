@@ -51,20 +51,38 @@ pip install -r requirements_server.txt
 
 ### 2. Start the server
 
+**Production (nginx on port 80, app on localhost:8000):**
+
 ```bash
 python server.py
+sudo cp deploy/nginx.conf /etc/nginx/sites-available/omnivoice
+# Edit server_name and web_demo path in the config, then:
+sudo ln -sf /etc/nginx/sites-available/omnivoice /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Clients connect to `ws://<your-host>/ws/tts` and `http://<your-host>/health` through nginx.
+
+**Local dev without nginx** (bind on all interfaces):
+
+```bash
+HOST=0.0.0.0 python server.py
 ```
 
 The server will:
 1. Download `k2-fsa/OmniVoice` from HuggingFace (first run)
-2. Pre-tokenise `voice_reference/man_voice.mp3` as the default voice
+2. Pre-tokenise voice profiles from `voice_reference/`
 3. Run a pre-warmup inference
-4. Start listening on `ws://0.0.0.0:8000/ws/tts`
+4. Listen on `127.0.0.1:8000` by default (or `0.0.0.0` when `HOST=0.0.0.0`)
 
 **Environment variables** (all optional):
 
 | Variable | Default | Description |
 |---|---|---|
+| `HOST` | `127.0.0.1` | Uvicorn bind address (`0.0.0.0` for direct access) |
+| `PORT` | `8000` | Uvicorn port (nginx upstream must match) |
+| `OMNIVOICE_TRUST_PROXY` | `1` | Honor `X-Forwarded-*` from nginx |
+| `OMNIVOICE_FORWARDED_ALLOW_IPS` | `127.0.0.1,::1` | Trusted proxy IPs for forwarded headers |
 | `OMNIVOICE_MODEL` | `k2-fsa/OmniVoice` | HuggingFace model ID or local path |
 | `OMNIVOICE_DEVICE` | auto | `cuda`, `mps`, or `cpu` |
 | `CHUNK_CHARS` | `60` | Sentence chunk size in characters |
@@ -116,12 +134,39 @@ You > Hello, how are you doing today? I hope everything is going well.
   "encoding": "wav/pcm16",
   "sample_rate": 24000,
   "chunk_index": 0,
+  "total_chunks": 2,
   "chunk_text": "Your text here.",
   "chunk_audio_ms": 1200,
   "chunk_gen_ms": 141.3,
   "first_chunk_latency_ms": 143.0   // only on chunk_index == 0
 }
 ```
+
+Keep the WebSocket open and read messages until you receive **`response.audio.done`**
+(do not close after the first `response.audio.delta`). **Send the next
+`tts.request` on the same socket** — do not open a new connection per utterance.
+Each delta includes `total_chunks` so you know how many audio messages to expect.
+
+**Server logs** (one TCP connection, many requests):
+
+```
+WS connected  session=a1b2c3d4  ...
+WS TTS request  session=a1b2c3d4  req=1  ...
+Done.  session=a1b2c3d4  req=1  ...
+WS session=a1b2c3d4  req=1  complete — connection stays open for next tts.request
+WS TTS request  session=a1b2c3d4  req=2  ...    ← same session id, no second "connected"
+```
+
+**Verify persistence:**
+
+```bash
+python scripts/test_ws_persistent.py --url ws://localhost:8000/ws/tts --requests 3
+```
+
+**Launch correctly:** use `python server.py`, not bare `uvicorn server:app` (bare
+uvicorn uses a 20s WebSocket ping timeout and can drop idle/busy clients). Set
+`OMNIVOICE_WS_PROTOCOL_PING=0` in `.env` unless your client answers RFC6455 pongs
+during synthesis.
 
 **Done signal** (sent after all chunks):
 ```json
@@ -163,8 +208,12 @@ audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 ## Health Check
 
 ```bash
-curl http://localhost:8000/health
-# {"status":"ok","model":"k2-fsa/OmniVoice","sample_rate":24000,"device":"cuda:0","voice_prompt_ready":true}
+# Through nginx
+curl http://localhost/health
+
+# Direct to uvicorn (bypass nginx)
+curl http://127.0.0.1:8000/health
+# {"status":"ok","model":"k2-fsa/OmniVoice","sample_rate":24000,"device":"cuda:0",...}
 ```
 
 ---

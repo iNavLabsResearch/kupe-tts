@@ -380,7 +380,11 @@
     <h2>Configuration</h2>
     <div class="form-grid">
       <label class="text-row">API base URL (HTTP or HTTPS — REST + WebSocket derived from this)
-        <input id="apiBase" type="text" placeholder="http://localhost:8000" spellcheck="false" autocomplete="off" />
+        <input id="apiBase" type="text" placeholder="http://localhost" spellcheck="false" autocomplete="off" />
+      </label>
+      <label class="text-row" title="Same value as OMNIVOICE_API_KEY in server .env. Sent as Authorization: Bearer and on WebSocket as ?api_key=">
+        API key
+        <input id="apiKey" type="password" placeholder="OMNIVOICE_API_KEY from .env" spellcheck="false" autocomplete="off" />
       </label>
       <label>WebSocket URL (auto-filled; edit if you use a separate WS host)
         <input id="url" spellcheck="false" autocomplete="off" />
@@ -388,7 +392,13 @@
       <label>Voice
         <select id="voiceSelect"></select>
       </label>
-      <label>First-chunk diffusion steps (empty = server default)
+      <label>Model type
+        <select id="modelType">
+          <option value="triton" selected>triton (fast)</option>
+          <option value="standard">standard (PyTorch)</option>
+        </select>
+      </label>
+      <label>First-chunk diffusion steps (empty = server default 8)
         <input id="epochsFc" type="number" min="1" max="128" step="1" placeholder="default" />
       </label>
       <label>Rest-chunk steps — mid + last chunks (empty = server default)
@@ -439,7 +449,12 @@
           <option value="1">yes</option>
         </select>
       </label>
-      <label>&nbsp;</label>
+      <label>Binary audio (PCM16 via WS)
+        <select id="binaryAudio">
+          <option value="0" selected>no (JSON base64)</option>
+          <option value="1">yes (Binary frames)</option>
+        </select>
+      </label>
       <label>Digit pronunciation (how digits are spoken)
         <input id="digitPronunciation" list="digitPronList" placeholder="empty = auto from script" autocomplete="off" />
       </label>
@@ -713,29 +728,36 @@ const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, c => (
 
 const LS_API_BASE = 'omnivoice_demo_api_base';
 const LS_WS_URL   = 'omnivoice_demo_ws_url';
+const LS_API_KEY  = 'omnivoice_demo_api_key';
 
-/** ngrok free / dev tunnels often return an HTML interstitial unless this header is sent. */
-function tunnelBrowserFetchHeaders() {
-  return {
-    'ngrok-skip-browser-warning': 'true',
-    'Accept': 'application/json',
-  };
+function apiKeyTrim() {
+  const el = $('apiKey');
+  return el ? (el.value || '').trim() : '';
 }
 
-/** WebSocket API cannot set custom headers; ngrok accepts the same flag as a query param. */
-function withTunnelWsQuery(wsUrl) {
+function apiFetchHeaders(extra) {
+  const h = { Accept: 'application/json', ...(extra || {}) };
+  const key = apiKeyTrim();
+  if (key) {
+    h.Authorization = 'Bearer ' + key;
+    h['x-api-key'] = key;
+  }
+  return h;
+}
+
+/** Browsers cannot set Authorization on WebSocket — append ?api_key= for auth middleware. */
+function websocketUrlWithAuth(rawUrl) {
+  const key = apiKeyTrim();
+  const url = (rawUrl || '').trim();
+  if (!key || !url) return url;
   try {
-    const u = new URL(wsUrl);
-    const h = u.hostname.toLowerCase();
-    if (
-      h.includes('ngrok-free.app') || h.includes('ngrok.io') ||
-      h.endsWith('loca.lt') || h.includes('localhost.run')
-    ) {
-      u.searchParams.set('ngrok-skip-browser-warning', 'true');
-      return u.toString();
-    }
-  } catch (_) { /* ignore */ }
-  return wsUrl;
+    const u = new URL(url);
+    u.searchParams.set('api_key', key);
+    return u.toString();
+  } catch {
+    const sep = url.includes('?') ? '&' : '?';
+    return url + sep + 'api_key=' + encodeURIComponent(key);
+  }
 }
 
 /** Reject truncated / broken saved WebSocket URLs (e.g. missing host path). */
@@ -759,7 +781,7 @@ function apiBaseTrim() {
 /** Build default ws(s)://host/ws/tts from http(s) API origin. */
 function originToDefaultWs(origin) {
   let o = (origin || '').trim().replace(/\/$/, '');
-  if (!o) o = 'http://localhost:8000';
+  if (!o) o = 'http://localhost';
   // IMPORTANT: replace https before http — otherwise /^http:/ matches the "http" prefix of "https:".
   const ws = o.replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:');
   return ws + (/\/ws\/tts$/i.test(ws) ? '' : '/ws/tts');
@@ -773,6 +795,7 @@ function saveApiPrefs() {
   try {
     localStorage.setItem(LS_API_BASE, apiBaseTrim());
     localStorage.setItem(LS_WS_URL, ($('url').value || '').trim());
+    localStorage.setItem(LS_API_KEY, apiKeyTrim());
   } catch (_) {}
 }
 
@@ -800,7 +823,7 @@ async function fetchVoicesJson() {
   const url = base + '/api/voices';
   const r = await fetch(url, {
     cache: 'no-store',
-    headers: tunnelBrowserFetchHeaders(),
+    headers: apiFetchHeaders(),
   });
   const ct = (r.headers.get('content-type') || '').toLowerCase();
   if (!r.ok) {
@@ -811,7 +834,7 @@ async function fetchVoicesJson() {
     const t = await r.text();
     throw new Error(
       `Expected JSON from /api/voices, got ${ct || 'unknown'} ` +
-      `(tunnel HTML? try ngrok header). Body: ${t.slice(0, 120).replace(/\s+/g, ' ')}…`
+      `Body: ${t.slice(0, 120).replace(/\s+/g, ' ')}…`
     );
   }
   const j = await r.json();
@@ -899,7 +922,7 @@ async function loadVoiceForEdit(name) {
     const base = apiBaseTrim();
     const r = await fetch(base + '/api/voices/' + encodeURIComponent(name), {
       cache: 'no-store',
-      headers: tunnelBrowserFetchHeaders(),
+      headers: apiFetchHeaders(),
     });
     const ct = (r.headers.get('content-type') || '').toLowerCase();
     const txt = await r.text();
@@ -966,7 +989,7 @@ async function saveVoiceEdit() {
     const base = apiBaseTrim();
     const r = await fetch(base + '/api/voices/' + encodeURIComponent(orig), {
       method: 'PUT',
-      headers: { 'ngrok-skip-browser-warning': 'true' },
+      headers: apiFetchHeaders(),
       body: fd,
     });
     const txt = await r.text();
@@ -1005,7 +1028,7 @@ async function deleteVoiceProfile(name) {
     const base = apiBaseTrim();
     const r = await fetch(base + '/api/voices/' + encodeURIComponent(name), {
       method: 'DELETE',
-      headers: tunnelBrowserFetchHeaders(),
+      headers: apiFetchHeaders(),
     });
     const txt = await r.text();
     let j = null;
@@ -1068,7 +1091,7 @@ async function createPersona() {
   try {
     const r = await fetch(base + '/api/voices', {
       method: 'POST',
-      headers: { 'ngrok-skip-browser-warning': 'true' },
+      headers: apiFetchHeaders(),
       body: fd,
     });
     const txt = await r.text();
@@ -1545,7 +1568,7 @@ async function playWavArrayBuffer(wavAb) {
  * Stream runner
  * ==================================================================== */
 function runStream(streamId, params, onComplete) {
-  const wsUrl = withTunnelWsQuery(params.url);
+  const wsUrl = websocketUrlWithAuth(params.url);
   const ws    = new WebSocket(wsUrl);
   const state = {
     tSend: 0, firstAt: 0, chunks: 0, audioMs: 0, ws,
@@ -1562,9 +1585,11 @@ function runStream(streamId, params, onComplete) {
       text:  params.text,
       voice: params.voice,
       speed: params.speed,
+      model_type: params.modelType,
     };
     if (params.language && params.language !== 'auto') msg.language = params.language;
     if (params.high_quality) msg.use_high_quality = true;
+    if (params.binary_audio) msg.binary_audio = true;
     if (params.epochsFc != null) msg.epochs_fc = params.epochsFc;
     if (params.epochsRest != null) msg.epochs_rest = params.epochsRest;
     if (params.epochs != null) msg.epochs = params.epochs;
@@ -1573,7 +1598,7 @@ function runStream(streamId, params, onComplete) {
     ws.send(JSON.stringify(msg));
     setStatus(streamId, 'streaming', 'streaming');
     log(streamId, 'send',
-        `→ tts.request  voice=${params.voice}  lang=${params.language}  ` +
+        `→ tts.request  voice=${params.voice}  model=${params.modelType}  lang=${params.language}  ` +
         `speed=${params.speed}  epochs_fc=${params.epochsFc != null ? params.epochsFc : '∅'}  ` +
         `epochs_rest=${params.epochsRest != null ? params.epochsRest : '∅'}  ` +
         `epochs_legacy=${params.epochs != null ? params.epochs : '∅'}  ` +
@@ -1581,11 +1606,37 @@ function runStream(streamId, params, onComplete) {
         `chars=${params.text.length}`);
   };
 
+  ws.binaryType = 'arraybuffer';
+
   ws.onmessage = (ev) => {
+    if (ev.data instanceof ArrayBuffer) {
+      // Binary audio frame
+      const dv = new DataView(ev.data);
+      if (ev.data.byteLength < 8) return;
+      const chunk_index = dv.getUint16(0, true);
+      const flags = dv.getUint16(2, true);
+      const sample_count = dv.getUint32(4, true);
+      const pcm = new Uint8Array(ev.data, 8);
+      // Wait for the JSON meta to provide the sample rate, but we can assume 24000 or store PCM
+      // Actually we need the sample rate to build a WAV, which is delivered in response.audio.meta.
+      // So we'll store the PCM temporarily for the stream.
+      if (!streamStates[streamId].pendingPcm) streamStates[streamId].pendingPcm = {};
+      streamStates[streamId].pendingPcm[chunk_index] = pcm;
+      return;
+    }
+
+    if (typeof ev.data !== 'string') return;
+
     let m;
     try { m = JSON.parse(ev.data); } catch { return; }
 
-    if (m.type === 'response.audio.delta') {
+    if (m.type === 'ping') {
+      ws.send(JSON.stringify({ type: 'pong' }));
+      return;
+    }
+
+    const isAudioChunk = (m.type === 'response.audio.delta' || m.type === 'response.audio.meta');
+    if (isAudioChunk) {
       state.chunks++;
       state.audioMs += (m.chunk_audio_ms || 0);
 
@@ -1616,17 +1667,36 @@ function runStream(streamId, params, onComplete) {
         `chunk[${m.chunk_index}]  ${wallPart}${sincePart}${ep}  ` +
         `audio=${audSec}s  text="${preview}${(m.chunk_text||'').length > 50 ? '…' : ''}"`);
 
-      let wavAb;
-      try {
-        wavAb = wavBase64ToArrayBuffer(m.delta);
-      } catch (e) {
-        log(streamId, 'err', `audio base64 decode failed: ${e.message}`);
-        return;
+      if (m.delta) {
+        let wavAb;
+        try {
+          wavAb = wavBase64ToArrayBuffer(m.delta);
+        } catch (e) {
+          log(streamId, 'err', `audio base64 decode failed: ${e.message}`);
+          return;
+        }
+        if (!streamAudioChunks[streamId]) streamAudioChunks[streamId] = [];
+        streamAudioChunks[streamId].push(wavAb);
+        refreshAudioCacheStatus();
+        if (streamId === playStreamId) playWavArrayBuffer(wavAb);
+      } else if (m.type === 'response.audio.meta') {
+        const pcm = streamStates[streamId].pendingPcm && streamStates[streamId].pendingPcm[m.chunk_index];
+        if (pcm) {
+          const sampleRate = m.sample_rate || 24000;
+          const wavAb = buildWavFromPcm16(pcm, sampleRate, 1);
+          if (!streamAudioChunks[streamId]) streamAudioChunks[streamId] = [];
+          streamAudioChunks[streamId].push(wavAb);
+          refreshAudioCacheStatus();
+          if (streamId === playStreamId) playWavArrayBuffer(wavAb);
+          delete streamStates[streamId].pendingPcm[m.chunk_index];
+        }
       }
-      if (!streamAudioChunks[streamId]) streamAudioChunks[streamId] = [];
-      streamAudioChunks[streamId].push(wavAb);
-      refreshAudioCacheStatus();
-      if (streamId === playStreamId) playWavArrayBuffer(wavAb);
+
+      const total = m.total_chunks;
+      if (total != null && state.chunks < total) {
+        setStatus(streamId, 'streaming', `chunk ${state.chunks}/${total}`);
+      }
+      return;
     }
     else if (m.type === 'response.audio.done') {
       const wall = performance.now() - state.tSend;
@@ -1647,13 +1717,13 @@ function runStream(streamId, params, onComplete) {
         `done  chunks=${m.total_chunks}  audio=${m.total_audio_ms}ms  ` +
         `server_wall=${(m.total_gen_ms ?? 0).toFixed(0)}ms  ` +
         `client_wall=${wall.toFixed(0)}ms  rtf=${rtf}${epochPart}`);
-      try { ws.close(); } catch {}
+      // Keep the WebSocket open until the user stops the run or starts a new one.
+      // The server stays in its receive loop for more tts.request messages.
       onComplete(streamId, true);
     }
     else if (m.type === 'error') {
       setStatus(streamId, 'error', 'error');
       log(streamId, 'err', `server error: ${m.message}`);
-      try { ws.close(); } catch {}
       onComplete(streamId, false);
     }
   };
@@ -1724,8 +1794,10 @@ async function startRun() {
   const streamDelay = Math.max(0, parseFloat($('streamDelay').value) || 0);
   const text        = $('text').value;
   const hq          = $('hq').value === '1';
+  const binAudio    = $('binaryAudio') ? $('binaryAudio').value === '1' : false;
   const digitPronunciation = $('digitPronunciation').value.trim();
   const digitHint        = $('digitHint').value.trim();
+  const modelType        = $('modelType').value;
   playStreamId      = Math.min(concurrent, Math.max(1, parseInt($('playStream').value, 10) || 1));
 
   if (!url || !text) {
@@ -1739,7 +1811,7 @@ async function startRun() {
 
   ensureAudioContext();
   setAudioCard(true, `Playing audio from <strong>Stream ${playStreamId}</strong> · `
-    + `voice=${escapeHtml(voice)}, lang=${escapeHtml(language)}, speed=${speed}.`);
+    + `voice=${escapeHtml(voice)}, model=${escapeHtml(modelType)}, lang=${escapeHtml(language)}, speed=${speed}, binary=${binAudio}.`);
 
   $('start').disabled = true;
   $('stop').disabled  = false;
@@ -1766,13 +1838,13 @@ async function startRun() {
   log(0, 'send',
       `── Run start  N=${concurrent}  delay=${streamDelay}s  voice=${voice}  ` +
       `lang=${language}  speed=${speed}  ${epLog}  ` +
-      `chars=${text.length}  url=${url}  play=stream${playStreamId} ──`);
+      `chars=${text.length}  url=${url}  play=stream${playStreamId}  binary=${binAudio} ──`);
 
   let doneCount = 0;
   const params  = {
-    url, voice, language, speed, text, high_quality: hq,
+    url, voice, language, speed, text, high_quality: hq, binary_audio: binAudio,
     epochs: epochsLeg, epochsFc, epochsRest,
-    digitPronunciation, digitHint,
+    digitPronunciation, digitHint, modelType,
   };
   const onComplete = () => {
     doneCount++;
@@ -1854,7 +1926,9 @@ window.addEventListener('DOMContentLoaded', () => {
 
   const savedBase = localStorage.getItem(LS_API_BASE);
   const savedWs = localStorage.getItem(LS_WS_URL);
-  $('apiBase').value = (savedBase && savedBase.trim()) ? savedBase.trim() : 'http://localhost:8000';
+  const savedKey = localStorage.getItem(LS_API_KEY);
+  $('apiBase').value = (savedBase && savedBase.trim()) ? savedBase.trim() : 'http://localhost';
+  if ($('apiKey') && savedKey) $('apiKey').value = savedKey;
   if (savedWs && websocketUrlLooksComplete(savedWs)) $('url').value = savedWs.trim();
   else syncWsFromApiBase();
 
@@ -1865,6 +1939,13 @@ window.addEventListener('DOMContentLoaded', () => {
     if ($('tabVoices') && $('tabVoices').classList.contains('active')) refreshVoiceManagementTable();
   });
   $('url').addEventListener('change', saveApiPrefs);
+  if ($('apiKey')) {
+    $('apiKey').addEventListener('change', () => {
+      saveApiPrefs();
+      refreshVoiceList();
+      if ($('tabVoices') && $('tabVoices').classList.contains('active')) refreshVoiceManagementTable();
+    });
+  }
   $('refreshVoices').addEventListener('click', () => { saveApiPrefs(); refreshVoiceList(); });
   $('createVoice').addEventListener('click', createPersona);
 
@@ -1889,6 +1970,26 @@ window.addEventListener('DOMContentLoaded', () => {
 
   loadSampleFile();   // overlay with the file content if reachable
   refreshVoiceList();
+
+  // Sync model-type dropdown from the server's /health endpoint.
+  (async function fetchServerModelType() {
+    try {
+      const base = apiBaseTrim();
+      const r = await fetch(base + '/health', {
+        cache: 'no-store',
+        headers: apiFetchHeaders(),
+      });
+      if (r.ok) {
+        const j = await r.json();
+        if (j.model_type) {
+          const sel = $('modelType');
+          if ([...sel.options].some(o => o.value === j.model_type)) {
+            sel.value = j.model_type;
+          }
+        }
+      }
+    } catch (_) { /* server may not be running yet */ }
+  })();
 
   $('start').addEventListener('click', startRun);
   $('stop').addEventListener('click', stopRun);

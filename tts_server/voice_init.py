@@ -76,6 +76,8 @@ def build_voice_init_spec(
         "raw_ref_sr":       None,
         "raw_ref_text":     None,
         "cache_save_path":  None,
+        "ref_audio_path":   str(profile.resolve_ref_audio()),
+        "full_ref_text":    profile.ref_text,
     }
 
     if profile.has_cached_embedding():

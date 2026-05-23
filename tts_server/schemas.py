@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional, Union
 
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 from .config import EPOCHS_MAX, EPOCHS_MIN
 
@@ -100,3 +100,63 @@ class BatchTTSResponse(BaseModel):
     epochs:                int = Field(
         description="``num_step`` applied to every item in this response.",
     )
+
+
+# ---------------------------------------------------------------------------
+# OpenAI Speech API — POST /v1/audio/speech
+# https://platform.openai.com/docs/api-reference/audio/createSpeech
+# ---------------------------------------------------------------------------
+
+class OpenAIVoiceRef(BaseModel):
+    id: str = Field(..., min_length=1)
+
+
+class OpenAISpeechRequest(BaseModel):
+    input: str = Field(..., min_length=1, max_length=4096)
+    model: str = Field(..., min_length=1)
+    voice: Union[str, OpenAIVoiceRef]
+    instructions: Optional[str] = Field(
+        default=None,
+        description="Ignored — OmniVoice uses reference-audio voice cloning.",
+    )
+    response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = "mp3"
+    speed: Optional[float] = Field(default=None, ge=0.25, le=4.0)
+    stream_format: Optional[Literal["sse", "audio"]] = None
+
+    # OmniVoice extensions (not part of the OpenAI spec).
+    language: Optional[str] = Field(
+        default=None,
+        description="ISO-639-3 code, English name, or 'auto'.",
+    )
+    use_high_quality: bool = False
+    epochs: Optional[int] = Field(
+        default=None,
+        ge=EPOCHS_MIN,
+        le=EPOCHS_MAX,
+        validation_alias=AliasChoices("epochs", "inference_steps"),
+    )
+    digit_words_lang: Optional[str] = None
+    digit_words_hint: Optional[str] = None
+    digit_pronunciation: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("digit_pronunciation", "digitPronunciation"),
+    )
+
+    @field_validator("voice", mode="before")
+    @classmethod
+    def _normalize_voice(cls, value: object) -> Union[str, OpenAIVoiceRef]:
+        if isinstance(value, dict):
+            return OpenAIVoiceRef(**value)
+        return value
+
+
+class OpenAIModelObject(BaseModel):
+    id: str
+    object: Literal["model"] = "model"
+    created: int
+    owned_by: str = "omnivoice"
+
+
+class OpenAIModelList(BaseModel):
+    object: Literal["list"] = "list"
+    data: list[OpenAIModelObject]

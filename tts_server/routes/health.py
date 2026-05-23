@@ -19,6 +19,7 @@ from ..config import (
     MAX_REST_BATCH,
     MAX_WORKERS,
     MODEL_ID,
+    MODEL_TYPE,
     REST_CHUNK_STEPS,
     SORT_BATCH,
     SPEED_MAX,
@@ -57,6 +58,7 @@ async def health(request: Request):
     return {
         "status":               "ok",
         "model":                MODEL_ID,
+        "model_type":           getattr(state, "model_type", MODEL_TYPE),
         "device":               getattr(state, "device", "unknown"),
         "weight_dtype":         WEIGHT_DTYPE,
         "default_language":     DEFAULT_LANGUAGE,

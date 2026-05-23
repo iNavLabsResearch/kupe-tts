@@ -35,11 +35,16 @@ from omnivoice.models.omnivoice import (
 
 from .config import (
     MID_CHUNK_CFG,
+    MODEL_TYPE,
+    SYNC_TIMING,
     TORCH_COMPILE_MODE,
     USE_CUDNN_BENCH,
     USE_TF32,
 )
 from .digit_to_words import get_digit_to_word_service
+from .runtime.model_loader import attach_triton_hybrid, build_load_kwargs, load_model
+from .runtime.perf import apply_torch_perf_flags, patch_sage_attention
+from .runtime.prompts import resolve_voice_prompt
 from .voice_profiles import VoiceEmbedding
 
 log = logging.getLogger("omnivoice.worker")
@@ -67,7 +72,10 @@ def _clean_language(lang) -> Optional[str]:
 # Per-process globals (set once during worker_init)
 # ---------------------------------------------------------------------------
 _model:          Optional[OmniVoice]            = None
+_model_triton:   object                         = None  # omnivoice_triton runner
+_model_type:     str                            = "standard"
 _prompts:        dict[str, VoiceClonePrompt]    = {}    # name → prompt
+_triton_prompts: dict[str, dict]                = {}    # name → {"ref_audio": path, "ref_text": text}
 _default_voice:  str                            = ""    # fallback voice name
 _sr:             int                            = 24_000
 
@@ -83,64 +91,14 @@ def patch_sage_attention(enable: bool) -> None:
     and forwards everything else to the original SDPA so OmniVoice's block-padding
     attention masks keep working.
     """
-    if not enable:
-        log.info("SageAttention disabled.")
-        return
-    try:
-        from sageattention import sageattn  # type: ignore[import]
-    except ImportError:
-        log.warning("SageAttention requested but not installed — using SDPA.")
-        return
-
-    import torch.nn.functional as F
-
-    _orig_sdpa = F.scaled_dot_product_attention
-
-    def _smart_sdpa(
-        query, key, value,
-        attn_mask=None, dropout_p=0.0, is_causal=False,
-        scale=None, enable_gqa=False,
-    ):
-        if (
-            attn_mask is None
-            and dropout_p == 0.0
-            and query.dim() == 4
-            and query.dtype in (torch.float16, torch.bfloat16)
-            and query.is_cuda
-        ):
-            try:
-                return sageattn(
-                    query, key, value,
-                    tensor_layout="HND",
-                    is_causal=is_causal,
-                    sm_scale=scale,
-                )
-            except Exception:
-                pass
-        return _orig_sdpa(
-            query, key, value,
-            attn_mask=attn_mask, dropout_p=dropout_p,
-            is_causal=is_causal, scale=scale, enable_gqa=enable_gqa,
-        )
-
-    F.scaled_dot_product_attention = _smart_sdpa  # type: ignore[assignment]
-    torch.nn.functional.scaled_dot_product_attention = _smart_sdpa
-    log.info("SageAttention: smart SDPA wrapper installed.")
+    from .runtime.perf import patch_sage_attention as _patch
+    _patch(enable)
 
 
 def apply_torch_perf_flags() -> None:
     """Free GPU speedups: TF32, cuDNN benchmark, matmul precision."""
-    if not torch.cuda.is_available():
-        return
-    if USE_TF32:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-    if USE_CUDNN_BENCH:
-        torch.backends.cudnn.benchmark = True
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
+    from .runtime.perf import apply_torch_perf_flags as _apply
+    _apply()
 
 
 # ---------------------------------------------------------------------------
@@ -153,64 +111,18 @@ def _build_load_kwargs(
     attn_impl:     str,
 ) -> dict:
     """Translate ``WEIGHT_DTYPE`` into ``OmniVoice.from_pretrained`` kwargs."""
-    load_kw: dict[str, Any] = {"device_map": device}
-
-    if device == "cpu":
-        # bitsandbytes & fp16/bf16 require CUDA
-        load_kw["dtype"] = torch.float32
-        if weight_dtype != "fp32":
-            log.warning(
-                "device=cpu does not support %s; falling back to fp32.",
-                weight_dtype,
-            )
-    elif weight_dtype == "fp32":
-        load_kw["dtype"] = torch.float32
-    elif weight_dtype == "fp16":
-        load_kw["dtype"] = torch.float16
-    elif weight_dtype == "bf16":
-        load_kw["dtype"] = torch.bfloat16
-    elif weight_dtype in ("int8", "int4"):
-        try:
-            from transformers import BitsAndBytesConfig  # type: ignore[import]
-        except ImportError as exc:
-            raise RuntimeError(
-                f"OMNIVOICE_WEIGHT_DTYPE={weight_dtype!r} requires "
-                f"`transformers` and `bitsandbytes`. "
-                f"Install: pip install bitsandbytes"
-            ) from exc
-
-        if weight_dtype == "int8":
-            load_kw["quantization_config"] = BitsAndBytesConfig(
-                load_in_8bit=True,
-                bnb_8bit_compute_dtype=torch.float16,
-            )
-        else:  # int4
-            load_kw["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=torch.float16,
-            )
-        # bitsandbytes overrides dtype, but compute_dtype is fp16
-        load_kw["dtype"] = torch.float16
-    else:
-        load_kw["dtype"] = torch.float16
-
-    if attn_impl and attn_impl not in ("auto", ""):
-        load_kw["attn_implementation"] = attn_impl
-
-    return load_kw
+    return build_load_kwargs(device, weight_dtype, attn_impl)
 
 
 def _load_model(model_id: str, load_kw: dict) -> OmniVoice:
     """Load OmniVoice, gracefully retrying without ``attn_implementation``
     if the checkpoint metadata doesn't accept it."""
-    try:
-        return OmniVoice.from_pretrained(model_id, **load_kw)
-    except TypeError:
-        load_kw.pop("attn_implementation", None)
-        log.warning("attn_implementation kwarg not accepted; retrying without it.")
-        return OmniVoice.from_pretrained(model_id, **load_kw)
+    return load_model(model_id, load_kw)
+
+
+def _attach_triton_hybrid(runner: Any, model: OmniVoice, *, enable_sage: bool) -> None:
+    """Apply hybrid (Triton kernels + CUDA Graph) optimizations to an already-loaded model."""
+    attach_triton_hybrid(runner, model, enable_sage=enable_sage)
 
 
 # ---------------------------------------------------------------------------
@@ -286,39 +198,7 @@ def _resolve_voice_prompt(
              "cache_save_path": str | None,
            }
     """
-    cached = spec.get("cached_embedding")
-    if cached is not None:
-        log.info("[%s] Restoring voice prompt from cached embedding.", name)
-        embedding = VoiceEmbedding(
-            ref_audio_tokens=np.asarray(cached["ref_audio_tokens"], dtype=np.int64),
-            ref_text=str(cached["ref_text"]),
-            ref_rms=float(cached["ref_rms"]),
-            sampling_rate=int(cached["sampling_rate"]),
-            model_id=str(cached["model_id"]),
-            num_codebooks=int(cached["num_codebooks"]),
-            num_tokens=int(cached["num_tokens"]),
-        )
-        return _build_prompt_from_embedding(model, embedding)
-
-    raw_bytes = spec.get("raw_ref_bytes")
-    raw_sr    = spec.get("raw_ref_sr")
-    raw_text  = spec.get("raw_ref_text")
-    if raw_bytes is None or raw_sr is None:
-        raise RuntimeError(
-            f"Voice '{name}' has neither a cached embedding nor raw reference audio."
-        )
-    log.info("[%s] Building voice prompt from raw audio (cold path) …", name)
-    prompt, embedding = _build_prompt_from_audio(model, raw_bytes, int(raw_sr), raw_text)
-    embedding.model_id = model_id
-
-    cache_save_path = spec.get("cache_save_path")
-    if cache_save_path:
-        try:
-            embedding.to_npz(Path(cache_save_path))
-            log.info("[%s] Saved voice embedding cache → %s", name, cache_save_path)
-        except Exception as exc:
-            log.warning("[%s] Failed to save embedding cache: %s", name, exc)
-    return prompt
+    return resolve_voice_prompt(model, name, spec, model_id)
 
 
 def worker_init(
@@ -331,13 +211,16 @@ def worker_init(
     voices_init:        dict[str, dict],   # name → init spec (see _resolve_voice_prompt)
     default_voice:      str,
     default_language:   str,
+    model_type:         str = "triton",
 ) -> None:
     """One-time per-process initialisation.
 
     All voices listed in ``voices_init`` are loaded into worker memory once
     and addressable by name during generation.
     """
-    global _model, _prompts, _default_voice, _sr
+    global _model, _model_triton, _model_type, _prompts, _triton_prompts, _default_voice, _sr
+
+    _model_type = model_type
 
     logging.basicConfig(
         format="%(asctime)s %(levelname)s [Worker-%(process)d] %(message)s",
@@ -351,11 +234,35 @@ def worker_init(
     patch_sage_attention(use_sage)
 
     load_kw = _build_load_kwargs(device, weight_dtype, attn_impl)
-    log.info(
-        "Loading OmniVoice  model=%s  device=%s  weight_dtype=%s  attn=%s  sage=%s",
-        model_id, device, weight_dtype, attn_impl, use_sage,
-    )
-    _model = _load_model(model_id, load_kw)
+
+    if _model_type == "triton":
+        log.info(
+            "Loading OmniVoice (triton)  model=%s  device=%s  weight_dtype=%s  sage=%s",
+            model_id, device, weight_dtype, use_sage,
+        )
+        try:
+            from omnivoice_triton import create_runner as _create_triton_runner
+            _model_triton = _create_triton_runner("hybrid")
+        except ImportError:
+            log.warning(
+                "omnivoice-triton not installed — falling back to standard OmniVoice."
+            )
+            _model_type = "standard"
+
+    if _model_type == "standard" or _model is None:
+        log.info(
+            "Loading OmniVoice (standard)  model=%s  device=%s  weight_dtype=%s  attn=%s  sage=%s",
+            model_id, device, weight_dtype, attn_impl, use_sage,
+        )
+        _model = _load_model(model_id, load_kw)
+
+    # Always load the standard model for voice prompt creation / tokenizer access
+    if _model is None:
+        _model = _load_model(model_id, load_kw)
+
+    if _model_type == "triton" and _model_triton is not None:
+        _attach_triton_hybrid(_model_triton, _model, enable_sage=use_sage)
+
     _sr = _model.sampling_rate
 
     # ---- Resolve every voice prompt ---------------------------------
@@ -363,9 +270,15 @@ def worker_init(
         raise RuntimeError("Worker spawned with no voice profiles.")
 
     _prompts = {}
+    _triton_prompts = {}
     for name, spec in voices_init.items():
         try:
             _prompts[name] = _resolve_voice_prompt(_model, name, spec, model_id)
+            if spec.get("ref_audio_path"):
+                _triton_prompts[name] = {
+                    "ref_audio": spec["ref_audio_path"],
+                    "ref_text":  spec.get("full_ref_text", ""),
+                }
             p = _prompts[name]
             log.info(
                 "[%s] Voice ready  ref_text=%.60s…  tokens=(%d, %d)  rms=%.4f",
@@ -389,7 +302,8 @@ def worker_init(
              len(_prompts), sorted(_prompts.keys()), _default_voice)
 
     # ---- Optional torch.compile --------------------------------------
-    if use_compile and weight_dtype not in ("int4", "int8"):
+    # CUDA Graph (triton hybrid) replaces forward; torch.compile conflicts with it.
+    if use_compile and weight_dtype not in ("int4", "int8") and _model_type != "triton":
         try:
             log.info("Compiling model.forward (mode=%s) …", TORCH_COMPILE_MODE)
             _model.forward = torch.compile(  # type: ignore[assignment]
@@ -400,10 +314,19 @@ def worker_init(
             )
         except Exception as exc:
             log.warning("torch.compile failed: %s — continuing eager.", exc)
+    elif use_compile and _model_type == "triton":
+        log.info("torch.compile skipped (triton hybrid uses CUDA Graph).")
     elif use_compile:
         log.info("torch.compile skipped (incompatible with %s).", weight_dtype)
 
     # ---- Pre-warm at multiple batch sizes ----------------------------
+    # Use production-representative text lengths so cuDNN / CUDA Graph
+    # caches the best kernels for the shapes we actually see in production.
+    _WARM_TEXTS = [
+        "Welcome, how may I help?",                                     # ~25 chars (first-chunk)
+        "The quick brown fox jumps over the lazy dog near the river.",  # ~60 chars (rest-chunk)
+        "Please hold while I check your account details and verify the information you provided earlier today.",  # ~100 chars (long chunk)
+    ]
     warm_lang = _clean_language(default_language)
     log.info(
         "Pre-warming model (batch sizes 1, 2, 4)  default_lang=%s …",
@@ -413,8 +336,10 @@ def worker_init(
     warm_prompt = _prompts[_default_voice]
     for bs in (1, 2, 4):
         try:
+            # Cycle through representative text lengths
+            warm_batch = [_WARM_TEXTS[i % len(_WARM_TEXTS)] for i in range(bs)]
             _model.generate(
-                text=["Hello there."] * bs,
+                text=warm_batch,
                 language=warm_lang,
                 voice_clone_prompt=warm_prompt,
                 generation_config=cfg,
@@ -437,7 +362,7 @@ def worker_add_voice(name: str, spec: dict, model_id: str) -> int:
     """
     import os
 
-    global _model, _prompts
+    global _model, _prompts, _triton_prompts
 
     if _model is None:
         raise RuntimeError("worker_add_voice: model not initialised.")
@@ -445,6 +370,11 @@ def worker_add_voice(name: str, spec: dict, model_id: str) -> int:
         raise ValueError("worker_add_voice: empty voice name.")
     name = str(name).strip()
     _prompts[name] = _resolve_voice_prompt(_model, name, spec, model_id)
+    if spec.get("ref_audio_path"):
+        _triton_prompts[name] = {
+            "ref_audio": spec["ref_audio_path"],
+            "ref_text":  spec.get("full_ref_text", ""),
+        }
     p = _prompts[name]
     log.info(
         "[%s] Hot-loaded voice  pid=%d  tokens=(%d, %d)  rms=%.4f",
@@ -509,6 +439,7 @@ def worker_probe() -> dict:
         "voices":        sorted(_prompts.keys()),
         "default_voice": _default_voice,
         "sample_rate":   int(_sr),
+        "model_type":    _model_type,
     }
 
 
@@ -609,6 +540,13 @@ def worker_generate(
     else:
         speed_arg = [float(s) if s is not None else None for s in speeds]
 
+    t0 = time.perf_counter()
+    infer_model = _model
+    if _model_type == "triton" and _model_triton is not None:
+        triton_model = getattr(_model_triton, "model", None)
+        if triton_model is not None:
+            infer_model = triton_model
+
     gen_kwargs: dict[str, Any] = dict(
         text=texts,
         language=lang_arg,
@@ -617,17 +555,126 @@ def worker_generate(
     )
     if speed_arg is not None:
         gen_kwargs["speed"] = speed_arg
+    audios = infer_model.generate(**gen_kwargs)
 
-    t0 = time.perf_counter()
-    audios = _model.generate(**gen_kwargs)
-    if torch.cuda.is_available():
+    if SYNC_TIMING and torch.cuda.is_available():
         torch.cuda.synchronize()
     gen_ms = (time.perf_counter() - t0) * 1000.0
 
+    # Reuse a single BytesIO buffer to reduce GC pressure under load.
+    buf = io.BytesIO()
     wav_list: list[bytes] = []
     for audio in audios:
-        buf = io.BytesIO()
+        buf.seek(0)
+        buf.truncate(0)
         sf.write(buf, audio, _sr, format="WAV", subtype="PCM_16")
         wav_list.append(buf.getvalue())
 
     return wav_list, gen_ms
+
+
+def worker_generate_raw(
+    texts:        list[str],
+    cfg_dict:     dict,
+    languages:    Optional[list[Optional[str]]] = None,
+    voice_names:  Optional[list[Optional[str]]] = None,
+    speeds:       Optional[list[Optional[float]]] = None,
+    digit_words_langs: Optional[list[Optional[str]]] = None,
+    digit_words_hints: Optional[list[Optional[str]]] = None,
+    digit_pronunciations: Optional[list[Optional[str]]] = None,
+) -> tuple[list[np.ndarray], float]:
+    """Like :func:`worker_generate` but returns raw numpy arrays instead of
+    WAV-encoded bytes.  Used by the streaming pipeline to avoid redundant
+    WAV encode → decode → re-encode cycles.
+
+    Returns:
+        ``(audio_arrays, generation_ms)``  where each array is float32 1-D.
+    """
+    global _model, _prompts, _default_voice, _sr
+
+    if _model is None or not _prompts:
+        raise RuntimeError("Worker is not initialised. Call worker_init first.")
+
+    n = len(texts)
+    d_langs = list(digit_words_langs or [])[:n]
+    d_hints = list(digit_words_hints or [])[:n]
+    while len(d_langs) < n:
+        d_langs.append(None)
+    while len(d_hints) < n:
+        d_hints.append(None)
+    d_pros = list(digit_pronunciations or [])[:n]
+    while len(d_pros) < n:
+        d_pros.append(None)
+    texts = [
+        get_digit_to_word_service().normalize_for_tts(
+            t,
+            digit_pronunciation=dp,
+            digit_words_lang=dl,
+            digit_words_hint=dh,
+        )
+        for t, dl, dh, dp in zip(texts, d_langs, d_hints, d_pros)
+    ]
+
+    cfg = OmniVoiceGenerationConfig(**cfg_dict)
+
+    # ---- Resolve voice prompts per request --------------------------
+    if voice_names is None:
+        prompts = [_prompts[_default_voice]] * len(texts)
+    else:
+        prompts = []
+        for v in voice_names:
+            name = v or _default_voice
+            if name not in _prompts:
+                raise KeyError(
+                    f"Voice profile '{name}' not loaded in this worker. "
+                    f"Available: {sorted(_prompts.keys())}"
+                )
+            prompts.append(_prompts[name])
+
+    # ---- Resolve languages -----------------------------------------
+    cleaned_langs: Optional[list[Optional[str]]]
+    if languages is None:
+        cleaned_langs = None
+    else:
+        cleaned_langs = [_clean_language(l) for l in languages]
+
+    lang_arg: Any
+    if cleaned_langs is None or all(l is None for l in cleaned_langs):
+        lang_arg = None
+    elif len(set(cleaned_langs)) == 1:
+        lang_arg = cleaned_langs[0]
+    else:
+        lang_arg = list(cleaned_langs)
+
+    # ---- Resolve speed ---------------------------------------------
+    speed_arg: Any
+    if speeds is None or all(s is None for s in speeds):
+        speed_arg = None
+    elif len(set(speeds)) == 1:
+        s0 = speeds[0]
+        speed_arg = float(s0) if s0 is not None else None
+    else:
+        speed_arg = [float(s) if s is not None else None for s in speeds]
+
+    t0 = time.perf_counter()
+    infer_model = _model
+    if _model_type == "triton" and _model_triton is not None:
+        triton_model = getattr(_model_triton, "model", None)
+        if triton_model is not None:
+            infer_model = triton_model
+
+    gen_kwargs: dict[str, Any] = dict(
+        text=texts,
+        language=lang_arg,
+        voice_clone_prompt=prompts,
+        generation_config=cfg,
+    )
+    if speed_arg is not None:
+        gen_kwargs["speed"] = speed_arg
+    audios = infer_model.generate(**gen_kwargs)
+
+    if SYNC_TIMING and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    gen_ms = (time.perf_counter() - t0) * 1000.0
+
+    return audios, gen_ms

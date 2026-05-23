@@ -34,79 +34,14 @@ logger = logging.getLogger("omnivoice.voices")
 
 router = APIRouter()
 
-_ALLOWED_AUDIO_EXT = frozenset({".wav", ".mp3", ".flac", ".ogg", ".webm", ".m4a"})
-
-
-def _slug_voice_name(raw: str) -> str:
-    s = (raw or "").strip().lower()
-    s = re.sub(r"[^a-z0-9_]+", "_", s)
-    s = re.sub(r"_+", "_", s).strip("_")
-    if not s:
-        raise HTTPException(400, "Voice name is empty or invalid after normalisation.")
-    if len(s) > 64:
-        s = s[:64]
-    return s
-
-
-def _safe_audio_suffix(filename: str) -> str:
-    suf = Path(filename or "").suffix.lower()
-    if suf not in _ALLOWED_AUDIO_EXT:
-        raise HTTPException(
-            400,
-            f"Unsupported audio extension {suf!r}. Allowed: "
-            f"{', '.join(sorted(_ALLOWED_AUDIO_EXT))}",
-        )
-    return suf
-
-
-async def _broadcast_to_workers(
-    executor: ProcessPoolExecutor,
-    fn,
-    *args,
-    label: str = "task",
-) -> list[int]:
-    """Run picklable *fn* on the pool until each worker PID has been seen at least once."""
-    loop = asyncio.get_running_loop()
-    max_w = int(getattr(executor, "_max_workers", None) or MAX_WORKERS)
-    seen: set[int] = set()
-    max_attempts = max(max_w * 12, 24)
-    for _ in range(max_attempts):
-        if len(seen) >= max_w:
-            break
-        pid = int(await loop.run_in_executor(executor, fn, *args))
-        seen.add(pid)
-    if len(seen) < max_w:
-        logger.warning(
-            "Broadcast %s: only %d distinct worker PID(s) after %d submissions "
-            "(expected %d).",
-            label, len(seen), max_attempts, max_w,
-        )
-    return sorted(seen)
-
-
-def _try_slug(raw: str) -> str:
-    s = (raw or "").strip().lower()
-    s = re.sub(r"[^a-z0-9_]+", "_", s)
-    s = re.sub(r"_+", "_", s).strip("_")
-    return s
-
-
-def _load_profile_fuzzy(raw: str) -> VoiceProfile:
-    """Resolve *raw* URL segment to a :class:`VoiceProfile` on disk."""
-    raw = (raw or "").strip()
-    if not raw:
-        raise HTTPException(400, "Empty voice name.")
-    for key in (raw, _try_slug(raw)):
-        if not key:
-            continue
-        try:
-            return load_profile_by_name(key)
-        except FileNotFoundError:
-            continue
-    raise HTTPException(
-        404,
-        f"Voice {raw!r} not found. Available: {list_profiles()}",
-    )
+from ..services.voice_manager import (
+    _slug_voice_name,
+    _safe_audio_suffix,
+    _broadcast_to_workers,
+    _try_slug,
+    _load_profile_fuzzy,
+    _unlink_profile_files,
+)
 
 
 @router.get("/api/voices")
