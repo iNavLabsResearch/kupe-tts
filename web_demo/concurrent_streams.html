@@ -398,7 +398,7 @@
           <option value="standard">standard (PyTorch)</option>
         </select>
       </label>
-      <label>First-chunk diffusion steps (empty = server default)
+      <label>First-chunk diffusion steps (empty = server default 8)
         <input id="epochsFc" type="number" min="1" max="128" step="1" placeholder="default" />
       </label>
       <label>Rest-chunk steps — mid + last chunks (empty = server default)
@@ -449,7 +449,12 @@
           <option value="1">yes</option>
         </select>
       </label>
-      <label>&nbsp;</label>
+      <label>Binary audio (PCM16 via WS)
+        <select id="binaryAudio">
+          <option value="0" selected>no (JSON base64)</option>
+          <option value="1">yes (Binary frames)</option>
+        </select>
+      </label>
       <label>Digit pronunciation (how digits are spoken)
         <input id="digitPronunciation" list="digitPronList" placeholder="empty = auto from script" autocomplete="off" />
       </label>
@@ -1584,6 +1589,7 @@ function runStream(streamId, params, onComplete) {
     };
     if (params.language && params.language !== 'auto') msg.language = params.language;
     if (params.high_quality) msg.use_high_quality = true;
+    if (params.binary_audio) msg.binary_audio = true;
     if (params.epochsFc != null) msg.epochs_fc = params.epochsFc;
     if (params.epochsRest != null) msg.epochs_rest = params.epochsRest;
     if (params.epochs != null) msg.epochs = params.epochs;
@@ -1600,12 +1606,34 @@ function runStream(streamId, params, onComplete) {
         `chars=${params.text.length}`);
   };
 
+  ws.binaryType = 'arraybuffer';
+
   ws.onmessage = (ev) => {
-    // Binary PCM frames (binary_audio=true) are not JSON — ignore here; meta follows each frame.
+    if (ev.data instanceof ArrayBuffer) {
+      // Binary audio frame
+      const dv = new DataView(ev.data);
+      if (ev.data.byteLength < 8) return;
+      const chunk_index = dv.getUint16(0, true);
+      const flags = dv.getUint16(2, true);
+      const sample_count = dv.getUint32(4, true);
+      const pcm = new Uint8Array(ev.data, 8);
+      // Wait for the JSON meta to provide the sample rate, but we can assume 24000 or store PCM
+      // Actually we need the sample rate to build a WAV, which is delivered in response.audio.meta.
+      // So we'll store the PCM temporarily for the stream.
+      if (!streamStates[streamId].pendingPcm) streamStates[streamId].pendingPcm = {};
+      streamStates[streamId].pendingPcm[chunk_index] = pcm;
+      return;
+    }
+
     if (typeof ev.data !== 'string') return;
 
     let m;
     try { m = JSON.parse(ev.data); } catch { return; }
+
+    if (m.type === 'ping') {
+      ws.send(JSON.stringify({ type: 'pong' }));
+      return;
+    }
 
     const isAudioChunk = (m.type === 'response.audio.delta' || m.type === 'response.audio.meta');
     if (isAudioChunk) {
@@ -1651,6 +1679,17 @@ function runStream(streamId, params, onComplete) {
         streamAudioChunks[streamId].push(wavAb);
         refreshAudioCacheStatus();
         if (streamId === playStreamId) playWavArrayBuffer(wavAb);
+      } else if (m.type === 'response.audio.meta') {
+        const pcm = streamStates[streamId].pendingPcm && streamStates[streamId].pendingPcm[m.chunk_index];
+        if (pcm) {
+          const sampleRate = m.sample_rate || 24000;
+          const wavAb = buildWavFromPcm16(pcm, sampleRate, 1);
+          if (!streamAudioChunks[streamId]) streamAudioChunks[streamId] = [];
+          streamAudioChunks[streamId].push(wavAb);
+          refreshAudioCacheStatus();
+          if (streamId === playStreamId) playWavArrayBuffer(wavAb);
+          delete streamStates[streamId].pendingPcm[m.chunk_index];
+        }
       }
 
       const total = m.total_chunks;
@@ -1755,6 +1794,7 @@ async function startRun() {
   const streamDelay = Math.max(0, parseFloat($('streamDelay').value) || 0);
   const text        = $('text').value;
   const hq          = $('hq').value === '1';
+  const binAudio    = $('binaryAudio') ? $('binaryAudio').value === '1' : false;
   const digitPronunciation = $('digitPronunciation').value.trim();
   const digitHint        = $('digitHint').value.trim();
   const modelType        = $('modelType').value;
@@ -1771,7 +1811,7 @@ async function startRun() {
 
   ensureAudioContext();
   setAudioCard(true, `Playing audio from <strong>Stream ${playStreamId}</strong> · `
-    + `voice=${escapeHtml(voice)}, model=${escapeHtml(modelType)}, lang=${escapeHtml(language)}, speed=${speed}.`);
+    + `voice=${escapeHtml(voice)}, model=${escapeHtml(modelType)}, lang=${escapeHtml(language)}, speed=${speed}, binary=${binAudio}.`);
 
   $('start').disabled = true;
   $('stop').disabled  = false;
@@ -1798,11 +1838,11 @@ async function startRun() {
   log(0, 'send',
       `── Run start  N=${concurrent}  delay=${streamDelay}s  voice=${voice}  ` +
       `lang=${language}  speed=${speed}  ${epLog}  ` +
-      `chars=${text.length}  url=${url}  play=stream${playStreamId} ──`);
+      `chars=${text.length}  url=${url}  play=stream${playStreamId}  binary=${binAudio} ──`);
 
   let doneCount = 0;
   const params  = {
-    url, voice, language, speed, text, high_quality: hq,
+    url, voice, language, speed, text, high_quality: hq, binary_audio: binAudio,
     epochs: epochsLeg, epochsFc, epochsRest,
     digitPronunciation, digitHint, modelType,
   };
